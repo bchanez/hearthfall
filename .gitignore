@@ -1,0 +1,23 @@
+# --- Build output ---
+build/
+cmake-build-*/
+out/
+
+# --- CMake ---
+CMakeUserPresets.json
+compile_commands.json
+
+# --- Dependencies fetched locally ---
+_deps/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+.clangd/
+*.user
+
+# --- Runtime save data ---
+save/
+
+# --- OS ---
+.DS_Store
