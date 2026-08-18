@@ -300,10 +300,14 @@ void Renderer::drawGround(const World& world, const Vec2& cam, int screenW, int 
 }
 
 void Renderer::drawBaked(const BakedSprite& s, const Vec2& center, float half, bool flipX,
-                         Uint8 alpha, double angleDeg, SDL_BlendMode blend) {
+                         Uint8 alpha, double angleDeg, SDL_BlendMode blend, float squashX,
+                         float squashY) {
     const float scale = (2.0f * half) / static_cast<float>(std::max(s.w, s.h));
     const float dw = s.w * scale, dh = s.h * scale;
-    SDL_FRect dst{center.x - dw * 0.5f, center.y - dh * 0.5f, dw, dh};
+    const float dw2 = dw * squashX, dh2 = dh * squashY;
+    // Anchor at the feet (bottom centre) so squash-&-stretch stays planted. With
+    // the default 1,1 squash this reduces exactly to the old centre anchor.
+    SDL_FRect dst{center.x - dw2 * 0.5f, center.y + dh * 0.5f - dh2, dw2, dh2};
     SDL_SetTextureBlendMode(s.tex, blend);
     SDL_SetTextureAlphaMod(s.tex, alpha);
     SDL_RenderTextureRotated(sdl_, s.tex, nullptr, &dst, angleDeg, nullptr,
@@ -381,7 +385,32 @@ bool Renderer::drawCharacter(const std::string& base, Motion motion, int phase, 
         else if (motion == Motion::Attack) frame = static_cast<int>((ms / 90) % n);
         else frame = static_cast<int>((ms / 800 + phase) % n);
     }
-    drawBaked((*v)[frame], center, half, flipX, alpha);
+
+    // Procedural "juice": the DCSS art is a single static frame, so we fake life
+    // with time-based squash-&-stretch + a bob, anchored at the feet. The `phase`
+    // offset keeps a crowd from pulsing in unison.
+    const float t = SDL_GetTicks() / 1000.0f + static_cast<float>(phase) * 0.31f;
+    float bobY = 0.0f, sx = 1.0f, sy = 1.0f, lean = 0.0f;
+    if (motion == Motion::Walk) {
+        const float s = std::sin(t * 15.0f);       // ~2.4 steps/sec
+        const float hop = std::fabs(s);
+        bobY = -half * 0.14f * hop;                 // spring up off the ground
+        sy = 1.0f + 0.10f * hop;                    // stretch tall mid-hop
+        sx = 1.0f - 0.08f * hop;                    // pinch narrow
+        lean = 5.0f * s;                            // rock side to side
+    } else if (motion == Motion::Attack) {
+        const float env = std::fabs(std::sin(SDL_GetTicks() / 70.0f));
+        sx = 1.0f + 0.20f * env;                    // snappy anticipation pop
+        sy = 1.0f + 0.14f * env;
+        bobY = -half * 0.05f * env;
+    } else {
+        const float b = std::sin(t * 2.4f);         // calm idle breathing
+        sy = 1.0f + 0.035f * b;
+        sx = 1.0f - 0.025f * b;
+        bobY = -half * 0.02f * (b * 0.5f + 0.5f);
+    }
+    drawBaked((*v)[frame], {center.x, center.y + bobY}, half, flipX, alpha,
+              static_cast<double>(flipX ? -lean : lean), SDL_BLENDMODE_BLEND, sx, sy);
     return true;
 }
 

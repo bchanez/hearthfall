@@ -26,10 +26,13 @@ TEST(Net, should_round_trip_a_world_snapshot) {
 
     Entity e;
     e.alive = true;
+    e.id = 42;
     e.position = {300.0f, 400.0f};
     e.hp = 10;
     e.maxHp = 40;
     e.targetPlayer = 0;
+    e.level = 12;
+    e.elite = true;
     w.enemies.push_back(e);
 
     GroundItem g;
@@ -55,6 +58,9 @@ TEST(Net, should_round_trip_a_world_snapshot) {
     EXPECT_FLOAT_EQ(out.players[0].shieldTimer, 1.5f);
     ASSERT_EQ(out.enemies.size(), 1u);
     EXPECT_EQ(out.enemies[0].targetPlayer, 0);
+    EXPECT_EQ(out.enemies[0].id, 42);
+    EXPECT_EQ(out.enemies[0].level, 12);
+    EXPECT_TRUE(out.enemies[0].elite);
     ASSERT_EQ(out.loot.size(), 1u);
     EXPECT_EQ(out.loot[0].item.kind, ItemKind::Gold);
     EXPECT_EQ(out.inventory.size(), 1u);

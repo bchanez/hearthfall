@@ -87,7 +87,11 @@ bool Game::init() {
     }
 
     renderer_.emplace(sdlRenderer_);
-    renderer_->loadSprites(ScriptEngine::loadSprites("data"));  // render-only pixel art
+    // Art intentionally disabled: the world renders as primitives (coloured
+    // squares/rings, flat ground) while we rebuild the sprite pipeline from
+    // scratch. The Renderer/ScriptEngine sprite plumbing is kept and simply
+    // falls back to shapes whenever a sprite is missing — re-enable by feeding
+    // it a fresh sprite set here once the new art pass lands.
     running_ = true;
     return true;
 }

@@ -7,12 +7,7 @@
 
 BUILD_DIR := build/debug
 
-.PHONY: build run test format clean assets
-
-# Regenerate all hand-authored pixel art: ground tiles/props + character sheets.
-assets:
-	@python3 tools/build_tiles.py lua
-	@sh tools/gen_sprites.sh
+.PHONY: build run test format clean
 
 build:
 	@test -d $(BUILD_DIR) || cmake --preset debug

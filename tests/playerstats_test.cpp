@@ -44,5 +44,18 @@ TEST(PlayerStats, should_cap_crit_and_attack_speed) {
     EXPECT_FLOAT_EQ(attackCooldownMul(p), 0.25f);  // capped at 75% faster
 }
 
+TEST(PlayerStats, should_sum_and_cap_lifesteal) {
+    Player p;
+    p.hasWeapon = true;
+    p.weapon.affixes = {{AffixType::Lifesteal, 8}};
+    p.hasArmor = true;
+    p.armor.affixes = {{AffixType::Lifesteal, 5}};
+    EXPECT_EQ(lifestealPct(p), 13);  // 8 + 5
+
+    p.weapon.affixes = {{AffixType::Lifesteal, 90}};
+    p.hasArmor = false;
+    EXPECT_EQ(lifestealPct(p), 60);  // capped
+}
+
 }  // namespace
 }  // namespace game

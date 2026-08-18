@@ -88,8 +88,11 @@ private:
     // 2*half pixels (aspect kept), optionally mirrored, at `alpha`. `angleDeg`
     // rotates it clockwise (used to point projectiles along their velocity) and
     // `blend` swaps in additive blending for glow/streak passes.
+    // `squashX`/`squashY` non-uniformly scale the sprite (1,1 = none) anchored at
+    // the feet, so procedural squash-&-stretch stays grounded (see drawCharacter).
     void drawBaked(const BakedSprite& s, const Vec2& center, float half, bool flipX, Uint8 alpha,
-                   double angleDeg = 0.0, SDL_BlendMode blend = SDL_BLENDMODE_BLEND);
+                   double angleDeg = 0.0, SDL_BlendMode blend = SDL_BLENDMODE_BLEND,
+                   float squashX = 1.0f, float squashY = 1.0f);
     // Glowing, velocity-oriented projectiles: a dim additive halo + a short streak
     // up the tail + a crisp hot core, from the "bolt" effect sheet. Falls back to
     // the old solid square when no effect art is loaded.
