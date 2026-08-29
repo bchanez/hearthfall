@@ -43,6 +43,13 @@ constexpr float kHitStopBigKill = 0.11f;   // a boss/elite/alpha kill hangs the 
 constexpr float kHitStopHeavyHit = 0.03f;  // a hit that takes a big bite of max HP
 constexpr float kHitStopMax = 0.13f;       // ceiling so multi-kills never freeze long
 
+// Per-hit screen-shake: a light tremble on every landed blow (see hurtEnemy), so
+// connecting feels weighty even when it doesn't kill. Small + capped well under
+// the kill/reward shake so it never overwhelms them; decays fast in step.
+constexpr float kHitShakePerHit = 1.4f;    // shake added by one landed hit
+constexpr float kHitShakeCap = 4.5f;       // ceiling on the accumulated per-hit shake
+constexpr float kHitShakeDecay = 22.0f;    // per-second linear decay
+
 // Wave / difficulty tuning.
 constexpr int kBossEveryNWaves = 5;
 constexpr float kHpScalePerWave = 0.08f;   // enemies get +8% HP per wave cleared
@@ -593,17 +600,33 @@ void Simulation::applyAbilityStatus(Entity& enemy, AbilityStatus st, float dur, 
     }
 }
 
+// Cosmetic-only: pick the tint a spell's bolts/arc/ring should glow with, from its
+// on-hit rider and shape (fire for burn/bleed, frost for chill, lightning for a
+// chain, arcane for a plain magic cast). Never affects the sim — see SpellElement.
+static int spellElement(const AbilitySpec& spec, AttackStyle style) {
+    if (spec.effect == AbilityEffect::Chain) return ElemLightning;
+    switch (spec.status) {
+        case AbilityStatus::Burn: return ElemFire;
+        case AbilityStatus::Slow: return ElemFrost;
+        default: break;
+    }
+    return style == AttackStyle::Magic ? ElemArcane : ElemNeutral;
+}
+
 void Simulation::castAbility(Player& p, int playerId, const AbilitySpec& spec, int rank) {
     const int base = effectiveDamage(p) / 2;  // abilities scale partly with your build
     // Spell power lifts every ability above its base magnitude — a staff/focus/INT
     // caster hits far harder than the raw numbers (Phase 2 caster scaling).
     const int sp = spellPowerPct(p);
     auto amp = [sp](int dmg) { return dmg * (100 + sp) / 100; };
-    // A projectile carries its spell's status rider so it lands the effect on hit.
+    const int element = spellElement(spec, effectiveStyle(p));
+    // A projectile carries its spell's status rider so it lands the effect on hit,
+    // plus a cosmetic element tint so it reads as fire/frost/arcane in flight.
     auto tag = [&](Projectile& b) {
         b.statusType = static_cast<int>(spec.status);
         b.statusDur = spec.statusDur;
         b.statusPower = spec.statusPower;
+        b.element = element;
     };
     switch (spec.effect) {
         case AbilityEffect::Nova: {
@@ -618,6 +641,9 @@ void Simulation::castAbility(Player& p, int playerId, const AbilitySpec& spec, i
                 applyAbilityStatus(enemy, spec.status, spec.statusDur, spec.statusPower, dir);
             }
             p.attackFlash = std::max(p.attackFlash, 0.12f);
+            // A shock ring that expands out to the blast radius, so the instant
+            // AoE reads as a wave instead of a silent flash.
+            world_.vfx.push_back({SpellVfx::Ring, p.entity.position, {}, radius, 0.3f, 0.3f, element});
             break;
         }
         case AbilityEffect::Volley: {
@@ -677,6 +703,9 @@ void Simulation::castAbility(Player& p, int playerId, const AbilitySpec& spec, i
                 hurtEnemy(e, dmg, dir, playerId, static_cast<float>(dmg));
                 applyAbilityStatus(e, spec.status, spec.statusDur, spec.statusPower, dir);
                 e.hitFlash = std::max(e.hitFlash, 0.14f);
+                // Draw the arc for this link, so the chain is visible lightning
+                // leaping foe-to-foe rather than damage out of nowhere.
+                world_.vfx.push_back({SpellVfx::Arc, from, e.position, 0.0f, 0.16f, 0.16f, element});
                 hit.push_back(best);
                 from = e.position;
                 dmg = std::max(1, dmg * 4 / 5);  // -20% per link
@@ -958,6 +987,13 @@ void Simulation::step(float dt) {
     }
 
     updateProjectiles(dt);
+    // Fade transient spell VFX (chain arcs / nova rings) and bleed the per-hit
+    // shake down — both purely cosmetic, advanced only while the sim runs.
+    for (auto& fx : world_.vfx) fx.life -= dt;
+    world_.vfx.erase(std::remove_if(world_.vfx.begin(), world_.vfx.end(),
+                                    [](const SpellVfx& f) { return f.life <= 0.0f; }),
+                     world_.vfx.end());
+    world_.hitShake = clampToZero(world_.hitShake - kHitShakeDecay * dt);
     updateEnemies(dt);
     // Append any enemies spawned mid-step (slime splits) now that the loops are done.
     if (!pendingSpawns_.empty()) {
@@ -1065,8 +1101,9 @@ void Simulation::performAttack(int playerId) {
     // The equipped weapon decides how you fight; unarmed falls back to the class
     // style. Ranged reach comes from the weapon (long) or the class's unarmed poke.
     const AttackStyle style = effectiveStyle(p);
-    const float range = p.hasWeapon() ? (style == AttackStyle::Ranged ? kRangedWeaponRange
-                                                                     : kMeleeWeaponRange)
+    const bool projectileStyle = style == AttackStyle::Ranged || style == AttackStyle::Magic;
+    const float range = p.hasWeapon() ? (projectileStyle ? kRangedWeaponRange
+                                                          : kMeleeWeaponRange)
                                      : cls.attackRange;
 
     // Per-weapon mastery (Mabinogi): the specific weapon family you're swinging
@@ -1108,6 +1145,7 @@ void Simulation::performAttack(int playerId) {
         bolt.life = range / kProjectileSpeed;
         bolt.owner = playerId;
         bolt.pierce = std::max(0, p.boons.pierce);
+        bolt.element = style == AttackStyle::Magic ? ElemArcane : ElemNeutral;
         world_.projectiles.push_back(bolt);
     }
 }
@@ -1554,6 +1592,11 @@ void Simulation::hurtEnemy(Entity& enemy, int damage, const Vec2& fromDir, int k
         }
     }
     enemy.hitFlash = kHitFlash;
+    // Every landed hit trembles the screen a touch (not just kills), so spells and
+    // swings that connect but don't finish a foe still feel like they bite. A small
+    // per-hit pulse the Renderer folds into its shake; capped + decayed in step.
+    if (killerId >= 0)
+        world_.hitShake = std::min(kHitShakeCap, world_.hitShake + kHitShakePerHit);
     // Heavier enemies (bigger radius) resist knockback; bosses barely flinch.
     const float resist = 14.0f / std::max(enemy.radius, 1.0f);
     enemy.knockback = fromDir * (kKnockback * resist);

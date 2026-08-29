@@ -24,6 +24,11 @@ struct Projectile {
     int statusType = 0;
     float statusDur = 0.0f;
     int statusPower = 0;
+
+    // Visual element, purely cosmetic (see World::SpellElement): tints the bolt's
+    // glow/core so a fireball reads orange, a frost dart cyan, an arcane missile
+    // violet — instead of every projectile sharing one yellow sprite. Not networked.
+    int element = 0;
 };
 
 }  // namespace game

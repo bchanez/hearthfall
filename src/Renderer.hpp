@@ -116,6 +116,10 @@ private:
     // up the tail + a crisp hot core, from the "bolt" effect sheet. Falls back to
     // the old solid square when no effect art is loaded.
     void drawProjectiles(const World& world);
+    // Transient spell flourishes (chain lightning arcs, nova shock rings) drawn
+    // from World::vfx and faded on their life — the shapes that leave no world
+    // state to derive from. Additive + element-tinted (see drawSpellFx).
+    void drawSpellFx(const World& world);
     // The current frame of an effect's idle cycle (fast flicker), or nullptr if the
     // effect isn't loaded. Effects animate on a wall clock like characters do.
     const BakedSprite* effectFrame(const std::string& base);

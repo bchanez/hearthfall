@@ -31,6 +31,19 @@ Color enemyColor(EnemyType type) {
     return {200, 60, 60};
 }
 
+// Cosmetic tint for a spell/projectile element (see SpellElement). Warm bolts for
+// fire, icy for frost, violet for arcane, pale blue for lightning; neutral bolts
+// keep the old warm-yellow so bows/arrows look unchanged.
+Color elementColor(int element) {
+    switch (element) {
+        case ElemFire:      return {255, 120, 45};
+        case ElemFrost:     return {130, 215, 255};
+        case ElemArcane:    return {200, 120, 255};
+        case ElemLightning: return {170, 205, 255};
+        default:            return {250, 240, 150};  // ElemNeutral
+    }
+}
+
 // One colour per player slot, so couch players can tell themselves apart.
 Color playerColor(int index) {
     static const Color palette[] = {
@@ -323,11 +336,15 @@ void Renderer::drawProjectiles(const World& world) {
     const BakedSprite* fr = effectFrame("bolt");
     for (const auto& bolt : world.projectiles) {
         if (!bolt.alive) continue;
+        const Color tint = elementColor(bolt.element);
         if (!fr) {  // no effect art loaded → the old solid square
-            setColor(sdl_, 250, 240, 150);
+            setColor(sdl_, tint);
             fillSquare(sdl_, bolt.position, bolt.radius);
             continue;
         }
+        // Tint the shared bolt sheet per element (colour-mod multiplies the art),
+        // so the same sprite reads as fire/frost/arcane. Reset to white after.
+        SDL_SetTextureColorMod(fr->tex, tint.r, tint.g, tint.b);
         // Face travel; atan2 in SDL's y-down screen space already matches world y.
         const double ang = std::atan2(bolt.velocity.y, bolt.velocity.x) * 180.0 / M_PI;
         const Vec2 dir = bolt.velocity.normalized();
@@ -344,6 +361,60 @@ void Renderer::drawProjectiles(const World& world) {
         // 3) Hot core on top, crisp.
         drawBaked(*fr, bolt.position, half, false, 255, ang, SDL_BLENDMODE_BLEND);
     }
+    if (fr) SDL_SetTextureColorMod(fr->tex, 255, 255, 255);  // leave the sheet untinted
+}
+
+// Chain arcs + nova rings: the spell shapes that leave no world state, so we draw
+// them from the sim's transient buffer and fade on life/maxLife. All additive so
+// they read as light, tinted per element.
+void Renderer::drawSpellFx(const World& world) {
+    SDL_SetRenderDrawBlendMode(sdl_, SDL_BLENDMODE_ADD);
+    for (const auto& fx : world.vfx) {
+        const float k = fx.maxLife > 0.0f ? fx.life / fx.maxLife : 0.0f;  // 1 → 0
+        if (k <= 0.0f) continue;
+        const Color c = elementColor(fx.element);
+        if (fx.kind == SpellVfx::Arc) {
+            // A jagged bolt: subdivide a→b and jitter each joint sideways, so it
+            // looks like forked lightning rather than a ruler-straight line. The
+            // jitter is deterministic per-segment (no RNG needed on the render side).
+            const Vec2 d = fx.b - fx.a;
+            const float len = d.length();
+            if (len < 1.0f) continue;
+            const Vec2 dir = d * (1.0f / len);
+            const Vec2 perp{-dir.y, dir.x};
+            const int segs = 6;
+            const float amp = std::min(18.0f, len * 0.14f) * k;  // shrinks as it fades
+            Vec2 prev = fx.a;
+            for (int i = 1; i <= segs; ++i) {
+                const float t = static_cast<float>(i) / segs;
+                // A cheap zig that flips sign each joint and tapers at both ends.
+                const float envelope = std::sin(t * 3.14159f);
+                const float side = (i % 2 == 0 ? 1.0f : -1.0f) * envelope;
+                const Vec2 pt = fx.a + dir * (len * t) + perp * (side * amp);
+                for (int w = 0; w < 3; ++w) {  // 3 stacked passes = a fat glowing bolt
+                    const Uint8 a = static_cast<Uint8>((w == 1 ? 200 : 110) * k);
+                    SDL_SetRenderDrawColor(sdl_, c.r, c.g, c.b, a);
+                    SDL_RenderLine(sdl_, prev.x, prev.y + static_cast<float>(w - 1),
+                                   pt.x, pt.y + static_cast<float>(w - 1));
+                }
+                prev = pt;
+            }
+            drawGlow(fx.b, 22.0f * k, c.r, c.g, c.b, 30);  // a bright pop where it lands
+        } else {  // Ring: an expanding shock outline that thins as it grows.
+            const float rad = fx.radius * (1.0f - k);      // 0 → radius as it fades
+            const int steps = 40;
+            const Uint8 a = static_cast<Uint8>(180 * k);
+            SDL_SetRenderDrawColor(sdl_, c.r, c.g, c.b, a);
+            Vec2 prev{fx.a.x + rad, fx.a.y};
+            for (int i = 1; i <= steps; ++i) {
+                const float ang = 6.2831853f * static_cast<float>(i) / steps;
+                const Vec2 pt{fx.a.x + std::cos(ang) * rad, fx.a.y + std::sin(ang) * rad};
+                SDL_RenderLine(sdl_, prev.x, prev.y, pt.x, pt.y);
+                prev = pt;
+            }
+        }
+    }
+    SDL_SetRenderDrawBlendMode(sdl_, SDL_BLENDMODE_NONE);
 }
 
 bool Renderer::drawSprite(const char* name, const Vec2& center, float half, bool flipX, Uint8 alpha) {
@@ -484,6 +555,8 @@ void Renderer::draw(const World& world, bool showBank, int followPlayer, CameraM
 
     // Projectiles: glowing, velocity-oriented bolts (see drawProjectiles).
     drawProjectiles(world);
+    // Chain arcs + nova rings on top of the bolts.
+    drawSpellFx(world);
 
     // Enemies (red), with a thin HP bar when damaged and an aggro pip showing
     // which player they're chasing (in that player's colour).
@@ -739,6 +812,19 @@ void Renderer::updateShake(const World& world, float& offX, float& offY) {
     prevRareLoot_ = rareOnGround;
 
     shake_ = std::min(shake_, 12.0f);  // cap so it never nauseates
+
+    // The sim's per-hit tremble (every landed blow, not just kills) rides on top as
+    // a floor — max, not add, so it can't compound frame-to-frame into nausea. It
+    // decays in the sim, so it's already a live value we just read.
+    const float shown = std::max(shake_, world.hitShake);
+    if (shown > 0.05f) {
+        ++shakeTick_;
+        const float t = static_cast<float>(shakeTick_);
+        offX = std::sin(t * 1.7f) * shown;
+        offY = std::cos(t * 2.3f) * shown;
+        shake_ *= 0.85f;  // decay the render-side portion (hitShake decays in the sim)
+        return;
+    }
     if (shake_ > 0.05f) {
         ++shakeTick_;
         const float t = static_cast<float>(shakeTick_);

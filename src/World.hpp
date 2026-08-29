@@ -14,6 +14,27 @@
 
 namespace game {
 
+// Cosmetic element id carried by projectiles + spell VFX. Purely a tint hint the
+// Renderer maps to a colour; the sim never branches on it. Kept as a plain int on
+// the wire-facing structs so it costs nothing to ignore. (See Renderer::elementColor.)
+enum SpellElement { ElemNeutral = 0, ElemFire, ElemFrost, ElemArcane, ElemLightning };
+
+// A short-lived visual flourish the simulation emits and the Renderer draws +
+// fades. Covers the spell shapes that leave no lasting world state — a Chain
+// bolt's arc between foes, a Nova's expanding shock ring — so they read as
+// something instead of an invisible instant. Decayed in Simulation::step; host-
+// side only (not networked), matching the status-VFX policy.
+struct SpellVfx {
+    enum Kind { Arc, Ring };
+    Kind kind = Arc;
+    Vec2 a{};          // Arc: start point / Ring: centre
+    Vec2 b{};          // Arc: end point (unused by Ring)
+    float radius = 0.0f;  // Ring: peak radius it expands to
+    float life = 0.0f;    // seconds remaining, counts toward 0
+    float maxLife = 0.0f;  // initial life, so the Renderer can fade on life/maxLife
+    int element = 0;
+};
+
 // An item lying on the ground, waiting to be picked up.
 struct GroundItem {
     Vec2 position{};
@@ -186,6 +207,10 @@ struct World {
     std::vector<GroundItem> loot;
     std::vector<Projectile> projectiles;
 
+    // Transient spell flourishes (chain arcs, nova rings) the Renderer draws + the
+    // sim fades each step. Purely cosmetic, host-side (see SpellVfx).
+    std::vector<SpellVfx> vfx;
+
     int wave = 0;
 
     // Hit-stop: seconds the whole simulation is frozen so a heavy hit or a kill
@@ -194,6 +219,11 @@ struct World {
     // Purely a timing effect — snapshots simply stop changing, so clients see the
     // freeze for free without any netcode change.
     float hitStop = 0.0f;
+
+    // Per-hit screen-shake accumulator: bumped by every landed blow (hurtEnemy),
+    // decayed each step, folded into the Renderer's shake so connecting always
+    // trembles the view a little — not only kills. Purely cosmetic.
+    float hitShake = 0.0f;
 };
 
 // Concentric biome/difficulty ring radii, measured from the world centre. They
