@@ -26,8 +26,11 @@ struct InputState {
     bool unequip = false;
     bool usePotion = false;
     bool dash = false;
-    int classSelect = -1;  // -1 == no change this frame
-    int allocStat = -1;    // stat index to spend a point into this frame, or -1
+    int classSelect = -1;    // -1 == no change this frame
+    int allocStat = -1;      // stat index to spend a point into this frame, or -1
+    int chooseUpgrade = -1;  // level-up boon slot (0..2) picked this frame, or -1
+    int equipItem = -1;      // bank item index to equip this frame, or -1
+    int sellItem = -1;       // bank item index to sell this frame, or -1
 };
 
 enum MsgType : uint8_t { MSG_WELCOME = 1, MSG_SNAPSHOT = 2, MSG_INPUT = 3 };

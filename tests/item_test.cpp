@@ -58,5 +58,44 @@ TEST(Item, should_format_affix_labels) {
     EXPECT_EQ(affixLabel({AffixType::MaxHp, 25}), "+25 HP");
 }
 
+TEST(Item, should_fold_base_bonus_into_stat_total) {
+    // given a weapon with a base damage bonus AND a Damage affix
+    Item it{"Sword", 3.0f, ItemKind::Weapon, 10, 12, 0};
+    it.affixes = {{AffixType::Damage, 5}, {AffixType::Crit, 8}};
+
+    // then Damage folds the base bonus in; Crit is affix-only; others are zero
+    EXPECT_EQ(itemStatTotal(it, AffixType::Damage), 17);  // 12 base + 5 affix
+    EXPECT_EQ(itemStatTotal(it, AffixType::Crit), 8);
+    EXPECT_EQ(itemStatTotal(it, AffixType::MaxHp), 0);
+}
+
+TEST(Item, should_restrict_affixes_by_slot) {
+    // Offense on weapons, defense on body armour, either on the wildcard slots.
+    EXPECT_TRUE(slotAllowsAffix(EquipSlot::MainHand, AffixType::Damage));
+    EXPECT_FALSE(slotAllowsAffix(EquipSlot::MainHand, AffixType::MaxHp));
+    EXPECT_TRUE(slotAllowsAffix(EquipSlot::Chest, AffixType::MaxHp));
+    EXPECT_FALSE(slotAllowsAffix(EquipSlot::Chest, AffixType::Crit));
+    EXPECT_TRUE(slotAllowsAffix(EquipSlot::Ring1, AffixType::Crit));    // jewellery: any
+    EXPECT_TRUE(slotAllowsAffix(EquipSlot::Ring1, AffixType::MaxHp));
+    EXPECT_TRUE(slotAllowsAffix(EquipSlot::OffHand, AffixType::SpellPower));  // a focus
+}
+
+TEST(Item, should_scale_affix_magnitude_with_rarity) {
+    EXPECT_FLOAT_EQ(rarityAffixMul(Rarity::Uncommon), 1.0f);
+    EXPECT_GT(rarityAffixMul(Rarity::Rare), rarityAffixMul(Rarity::Uncommon));
+    EXPECT_GT(rarityAffixMul(Rarity::Epic), rarityAffixMul(Rarity::Rare));
+}
+
+TEST(Item, should_rank_a_stronger_weapon_higher_by_power) {
+    Item weak{"Dagger", 1.0f, ItemKind::Weapon, 0, 8, 0};
+    Item strong{"Greatsword", 5.0f, ItemKind::Weapon, 0, 14, 0};
+    strong.affixes = {{AffixType::Crit, 8}};
+
+    // 8*2=16  vs  14*2 + 8*2 = 44
+    EXPECT_EQ(itemPower(weak), 16);
+    EXPECT_EQ(itemPower(strong), 44);
+    EXPECT_GT(itemPower(strong), itemPower(weak));
+}
+
 }  // namespace
 }  // namespace game

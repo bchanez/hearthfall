@@ -105,14 +105,8 @@ const char* lootSprite(const Item& item) {
     return "loot_gold";
 }
 
-const char* className(ClassId id) {
-    switch (id) {
-        case ClassId::Human:  return "Human";
-        case ClassId::Tank:   return "Tank";
-        case ClassId::Archer: return "Archer";
-        case ClassId::Healer: return "Healer";
-    }
-    return "?";
+const char* className(ClassId) {
+    return "Adventurer";  // classless: everyone's a neutral adventurer, title comes from play
 }
 
 // Sprite keys — must match the `name` fields in data/sprites.lua.
@@ -441,7 +435,7 @@ void Renderer::drawGlow(const Vec2& center, float radius, Uint8 r, Uint8 g, Uint
 }
 
 void Renderer::draw(const World& world, bool showBank, int followPlayer, CameraMode mode,
-                    bool showChar) {
+                    bool showChar, int bankCursor) {
     ++frameCounter_;  // advances walk/idle animation cycles
     SDL_SetRenderViewport(sdl_, nullptr);
     setColor(sdl_, 16, 17, 27);  // deep cool void, matches the graded shadows
@@ -600,8 +594,11 @@ void Renderer::draw(const World& world, bool showBank, int followPlayer, CameraM
             fillSquare(sdl_, e.position, e.radius);
         }
         // Weapon in hand — a bow if ranged, else a blade — on the facing side.
-        if (p.hasWeapon) {
-            const char* wsprite = p.weapon.style == AttackStyle::Ranged ? "wpn_bow" : "wpn_sword";
+        if (p.hasWeapon()) {
+            const AttackStyle ws = p.weapon().style;
+            const char* wsprite = ws == AttackStyle::Ranged ? "wpn_bow"
+                                : ws == AttackStyle::Magic  ? "wpn_staff"
+                                                            : "wpn_sword";
             const float side = pFlip ? -1.0f : 1.0f;
             const Vec2 hand{e.position.x + side * e.radius * 0.95f, e.position.y + 2.0f};
             drawSprite(wsprite, hand, e.radius * 0.85f, pFlip, pAlpha);
@@ -644,7 +641,8 @@ void Renderer::draw(const World& world, bool showBank, int followPlayer, CameraM
     SDL_SetRenderScale(sdl_, 1.0f, 1.0f);
     drawHud(world);
     drawMinimap(world, screenW, screenH);
-    if (showBank) drawBankOverlay(world, screenW, screenH);
+    drawBoonChooser(world, screenW, screenH);
+    if (showBank) drawBankOverlay(world, screenW, screenH, bankCursor, followPlayer);
     if (showChar) drawCharSheet(world, screenW, screenH);
     SDL_RenderPresent(sdl_);
 }
@@ -766,7 +764,7 @@ void Renderer::drawHud(const World& world) {
 
     int potions = 0;
     for (const auto& it : world.inventory.items())
-        if (it.kind == ItemKind::Potion) ++potions;
+        if (it.kind == ItemKind::Potion) potions += it.count;  // sum stack sizes
 
     char line[224];
     std::snprintf(line, sizeof(line), "Wave %d%s   Gold %d   Pots %d   Bank %zu items %.1f/%.0f",
@@ -782,15 +780,30 @@ void Renderer::drawHud(const World& world) {
         const Player& p = world.players[i];
         if (!p.active) continue;
         const char* ability = p.abilityCooldown > 0.0f ? "..." : "READY";
-        char gear[32] = "";
-        if (p.hasWeapon || p.hasArmor) {
-            std::snprintf(gear, sizeof(gear), "  [W+%d A+%d]", p.hasWeapon ? p.weapon.bonusDamage : 0,
-                          p.hasArmor ? p.armor.bonusMaxHp : 0);
+        char gear[48] = "";
+        const int gdmg = gearDamage(p), ghp = gearMaxHp(p);
+        if (gdmg > 0 || ghp > 0) {
+            std::snprintf(gear, sizeof(gear), "  [W+%d A+%d]", gdmg, ghp);
         }
-        // Nudge to spend banked points; blinks so it catches the eye mid-fight.
+        // Boon count: the stacking per-run power, so the god-build reads at a glance.
+        if (p.boons.count > 0) {
+            char boon[16];
+            std::snprintf(boon, sizeof(boon), "  B%d", p.boons.count);
+            std::strncat(gear, boon, sizeof(gear) - std::strlen(gear) - 1);
+        }
+        // Auto-cast abilities acquired this run.
+        if (!p.abilities.empty()) {
+            char ab[16];
+            std::snprintf(ab, sizeof(ab), "  A%zu", p.abilities.size());
+            std::strncat(gear, ab, sizeof(gear) - std::strlen(gear) - 1);
+        }
+        // Encumbrance cue: warns that heavy gear is dragging your speed.
+        if (encumbranceMul(p) < 0.98f)
+            std::strncat(gear, "  (heavy)", sizeof(gear) - std::strlen(gear) - 1);
+        // Nudge to draft a pending level-up boon; blinks so it catches the eye.
         char pts[24] = "";
-        if (p.unspentPoints > 0 && (SDL_GetTicks() / 400) % 2 == 0)
-            std::snprintf(pts, sizeof(pts), "  +%d pt (C)", p.unspentPoints);
+        if (p.pendingBoons > 0 && (SDL_GetTicks() / 400) % 2 == 0)
+            std::snprintf(pts, sizeof(pts), "  LEVEL UP!");
         std::snprintf(line, sizeof(line), "P%d %-8s Lv%d  HP %d/%d   %s: %s%s%s", i + 1,
                       playerTitle(p), p.level, p.entity.hp, p.entity.maxHp,
                       p.cls.abilityName.c_str(), ability, gear, pts);
@@ -802,9 +815,65 @@ void Renderer::drawHud(const World& world) {
     SDL_RenderDebugText(
         sdl_, 6.0f, y,
         "Move WASD  aim mouse/R  atk Space/A  abil E/X  dash Shift/RB  equip F/Y  pot Q/LB");
-    SDL_RenderDebugText(sdl_, 6.0f, y + 12.0f,
-                        "Class 1/2/3/4 or D-pad   Bank Tab   Quit Esc");
+    SDL_RenderDebugText(sdl_, 6.0f, y + 12.0f, "Char sheet C   Bank Tab   Quit Esc");
 
+    SDL_SetRenderScale(sdl_, 1.0f, 1.0f);
+}
+
+void Renderer::drawBoonChooser(const World& world, int screenW, int screenH) {
+    // Any active player with a pending level-up choice? Collect them first so we
+    // can size a bottom-centre panel that stacks one offer block per player.
+    std::vector<int> choosing;
+    for (int i = 0; i < static_cast<int>(world.players.size()); ++i) {
+        const Player& p = world.players[i];
+        if (p.active && p.pendingBoons > 0 && p.boonChoices[0] >= 0) choosing.push_back(i);
+    }
+    if (choosing.empty()) return;
+
+    auto label = [&](int id) -> const char* {
+        if (id >= 0 && id < static_cast<int>(upgradeLabels_.size())) return upgradeLabels_[id].c_str();
+        return "Upgrade";
+    };
+
+    // Panel geometry in the 2x text space (all text below is drawn at scale 2).
+    SDL_SetRenderScale(sdl_, 2.0f, 2.0f);
+    const float vw = screenW / 2.0f, vh = screenH / 2.0f;  // virtual size at 2x
+    const float lineH = 12.0f;
+    const float blockH = lineH * 5.0f;  // header + 3 options + spacer per player
+    const float panelH = 14.0f + blockH * static_cast<float>(choosing.size());
+    const float panelW = 320.0f;
+    const float x0 = (vw - panelW) * 0.5f;
+    float y = vh - panelH - 10.0f;  // pinned near the bottom, out of the action
+
+    // Dim backdrop so the offer reads over a busy fight, without pausing it.
+    SDL_SetRenderScale(sdl_, 1.0f, 1.0f);
+    SDL_SetRenderDrawBlendMode(sdl_, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(sdl_, 0, 0, 0, 170);
+    SDL_FRect bg{x0 * 2.0f - 12.0f, y * 2.0f - 8.0f, panelW * 2.0f + 24.0f, panelH * 2.0f};
+    SDL_RenderFillRect(sdl_, &bg);
+    SDL_SetRenderDrawBlendMode(sdl_, SDL_BLENDMODE_NONE);
+    setColor(sdl_, 240, 220, 120);
+    SDL_RenderRect(sdl_, &bg);
+
+    SDL_SetRenderScale(sdl_, 2.0f, 2.0f);
+    char line[128];
+    for (int idx : choosing) {
+        const Player& p = world.players[idx];
+        setColor(sdl_, playerColor(idx));
+        // P1 (the keyboard seat) picks with number keys; pads pick with the D-pad.
+        const char* keys = idx == 0 ? "keys 1/2/3" : "D-pad L/U/R";
+        std::snprintf(line, sizeof(line), "P%d LEVEL UP!  choose a boon  (%s)", idx + 1, keys);
+        SDL_RenderDebugText(sdl_, x0, y, line);
+        y += lineH;
+        static const char* slotTag[3] = {"[1|<]", "[2|^]", "[3|>]"};
+        for (int s = 0; s < 3; ++s) {
+            setColor(sdl_, 235, 235, 240);
+            std::snprintf(line, sizeof(line), "  %s %s", slotTag[s], label(p.boonChoices[s]));
+            SDL_RenderDebugText(sdl_, x0, y, line);
+            y += lineH;
+        }
+        y += lineH;  // spacer between players
+    }
     SDL_SetRenderScale(sdl_, 1.0f, 1.0f);
 }
 
@@ -853,7 +922,8 @@ void Renderer::drawMinimap(const World& world, int screenW, int screenH) {
     SDL_RenderRect(sdl_, &view);
 }
 
-void Renderer::drawBankOverlay(const World& world, int screenW, int screenH) {
+void Renderer::drawBankOverlay(const World& world, int screenW, int screenH, int bankCursor,
+                               int refPlayer) {
     // Dim the screen, then draw the shared household bank contents.
     SDL_SetRenderDrawBlendMode(sdl_, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(sdl_, 0, 0, 0, 180);
@@ -872,36 +942,191 @@ void Renderer::drawBankOverlay(const World& world, int screenW, int screenH) {
                   world.inventory.currentWeight(), world.inventory.maxWeight(),
                   world.inventory.size());
     SDL_RenderDebugText(sdl_, x, y, line);
-    y += 20.0f;
+    y += 18.0f;
+
+    // Equipped gear per active player, so you can SEE what's on before you swap.
+    // (Equipping a bank item auto-returns the old piece, so a swap is one keypress.)
+    setColor(sdl_, 200, 220, 245);
+    SDL_RenderDebugText(sdl_, x, y, "EQUIPPED:");
+    y += 12.0f;
+    for (int i = 0; i < static_cast<int>(world.players.size()); ++i) {
+        const Player& pl = world.players[i];
+        if (!pl.active) continue;
+        setColor(sdl_, playerColor(i));
+        if (i == refPlayer) {
+            // The cursor's player: show the whole paperdoll, one line per slot, so
+            // empty slots read as targets to fill.
+            std::snprintf(line, sizeof(line), " P%d  (Dmg+%d  HP+%d)", i + 1, gearDamage(pl),
+                          gearMaxHp(pl));
+            SDL_RenderDebugText(sdl_, x, y, line);
+            y += 11.0f;
+            for (int s = 0; s < kEquipSlotCount; ++s) {
+                const EquipSlot es = static_cast<EquipSlot>(s);
+                const bool has = pl.equipment[s].has;
+                std::snprintf(line, sizeof(line), "   %-5s %s", slotName(es),
+                              has ? pl.equipment[s].item.name.c_str() : "-");
+                setColor(sdl_, has ? rarityColor(pl.equipment[s].item.rarity)
+                                   : Color{120, 120, 130});
+                SDL_RenderDebugText(sdl_, x, y, line);
+                y += 10.0f;
+            }
+        } else {
+            // Other players: a compact one-liner (main hand + totals).
+            const bool hw = pl.hasWeapon();
+            std::snprintf(line, sizeof(line), " P%d  Main:%s  (Dmg+%d HP+%d)", i + 1,
+                          hw ? pl.weapon().name.c_str() : "-", gearDamage(pl), gearMaxHp(pl));
+            SDL_RenderDebugText(sdl_, x, y, line);
+            y += 11.0f;
+        }
+    }
+    y += 8.0f;
+    setColor(sdl_, 240, 235, 200);
 
     const auto& items = world.inventory.items();
     if (items.empty()) {
         SDL_RenderDebugText(sdl_, x, y, "(empty - go kill something)");
     } else {
-        for (std::size_t i = 0; i < items.size(); ++i) {
+        const int count = static_cast<int>(items.size());
+        // Scroll window: fit as many rows as the space allows (2x text space, and
+        // leave room for the two hint lines), then slide it to keep the cursor in
+        // view — so a bank bigger than the screen stays fully navigable.
+        const float bottom = screenH / 2.0f - 42.0f;
+        int maxVisible = std::max(1, static_cast<int>((bottom - y) / 11.0f) - 1);
+        const int cursor = (bankCursor >= 0 && bankCursor < count) ? bankCursor : 0;
+        int start = 0;
+        if (count > maxVisible) start = std::clamp(cursor - maxVisible / 2, 0, count - maxVisible);
+        const int end = std::min(count, start + maxVisible);
+
+        if (start > 0) {
+            setColor(sdl_, 170, 170, 185);
+            SDL_RenderDebugText(sdl_, x, y, "   ^ more above");
+            y += 11.0f;
+        }
+        for (int i = start; i < end; ++i) {
             const Item& it = items[i];
-            // Name coloured by rarity; affixes summarised on the same line.
             std::string affixStr;
             for (const auto& a : it.affixes) {
                 affixStr += (affixStr.empty() ? "  " : " ");
                 affixStr += affixLabel(a);
             }
-            setColor(sdl_, (it.kind == ItemKind::Weapon || it.kind == ItemKind::Armor)
-                               ? rarityColor(it.rarity)
-                               : Color{240, 235, 200});
-            std::snprintf(line, sizeof(line), "- %-15s %.1fkg%s", it.name.c_str(), it.weight,
-                          affixStr.c_str());
+            const bool gear = it.kind == ItemKind::Weapon || it.kind == ItemKind::Armor;
+            const bool selected = i == cursor;
+            setColor(sdl_, selected ? Color{255, 255, 255}
+                                    : (gear ? rarityColor(it.rarity) : Color{240, 235, 200}));
+            char slot[6] = "  -";
+            if (i < 9) std::snprintf(slot, sizeof(slot), "[%d]", i + 1);
+            // Potions show what they heal (scales with rarity); gear shows its affixes.
+            char extra[32] = "";
+            if (it.kind == ItemKind::Potion)
+                std::snprintf(extra, sizeof(extra), "  x%d  heal %d%%", it.count,
+                              potionHealPercent(it.rarity));
+            else if (gear)
+                std::snprintf(extra, sizeof(extra), "  pow%d", itemPower(it));
+            std::snprintf(line, sizeof(line), "%s%s %-15s %.1fkg  %dg%s%s", selected ? ">" : " ",
+                          slot, it.name.c_str(), it.weight, it.value, affixStr.c_str(), extra);
             SDL_RenderDebugText(sdl_, x, y, line);
             y += 11.0f;
-            if (y > screenH / 2.0f - 20.0f) {  // scale is 2x, so half the raw height
-                SDL_RenderDebugText(sdl_, x, y, "...");
-                break;
-            }
+        }
+        if (end < count) {
+            setColor(sdl_, 170, 170, 185);
+            SDL_RenderDebugText(sdl_, x, y, "   v more below");
+            y += 11.0f;
         }
         setColor(sdl_, 240, 235, 200);
     }
 
-    SDL_RenderDebugText(sdl_, x, screenH / 2.0f - 12.0f, "(Tab to close)");
+    // Comparison panel (right column): the selected gear vs. what the cursor's
+    // player has equipped, stat by stat, so "is this an upgrade?" is answerable at
+    // a glance — green = better, red = worse. Weight inverts (lighter is better).
+    if (!items.empty()) {
+        const int count = static_cast<int>(items.size());
+        const int cursor = (bankCursor >= 0 && bankCursor < count) ? bankCursor : 0;
+        const Item& sel = items[cursor];
+        if (sel.slot != EquipSlot::None) {
+            // Reference player = the seat driving the cursor; fall back to the first
+            // active player if that index is somehow inactive/out of range.
+            const Player* rp = nullptr;
+            if (refPlayer >= 0 && refPlayer < static_cast<int>(world.players.size()) &&
+                world.players[refPlayer].active)
+                rp = &world.players[refPlayer];
+            else
+                for (const auto& pl : world.players)
+                    if (pl.active) { rp = &pl; break; }
+
+            // Compare against what's in the item's slot. For a ring, if the first
+            // finger is free but the second is taken, compare against that one.
+            EquipSlot cmpSlot = sel.slot;
+            if (cmpSlot == EquipSlot::Ring1 && rp && !rp->hasEquip(EquipSlot::Ring1) &&
+                rp->hasEquip(EquipSlot::Ring2))
+                cmpSlot = EquipSlot::Ring2;
+            const bool hasCur = rp && rp->hasEquip(cmpSlot);
+            const Item equipped = hasCur ? rp->equip(cmpSlot) : Item{};
+
+            float cx = screenW / 2.0f * 0.58f, cy = 70.0f;
+            setColor(sdl_, 200, 220, 245);
+            std::snprintf(line, sizeof(line), "COMPARE (%s)", slotName(sel.slot));
+            SDL_RenderDebugText(sdl_, cx, cy, line);
+            cy += 12.0f;
+            setColor(sdl_, 255, 255, 255);
+            std::snprintf(line, sizeof(line), "%.20s", sel.name.c_str());
+            SDL_RenderDebugText(sdl_, cx, cy, line);
+            cy += 11.0f;
+            setColor(sdl_, 170, 175, 185);
+            std::snprintf(line, sizeof(line), "vs %.17s", hasCur ? equipped.name.c_str() : "(nothing)");
+            SDL_RenderDebugText(sdl_, cx, cy, line);
+            cy += 13.0f;
+
+            // One row per stat where either side is non-zero.
+            const AffixType order[] = {AffixType::Damage,   AffixType::MaxHp,
+                                       AffixType::AttackSpeed, AffixType::MoveSpeed,
+                                       AffixType::Crit,      AffixType::Lifesteal,
+                                       AffixType::SpellPower};
+            for (AffixType t : order) {
+                const int a = itemStatTotal(equipped, t);
+                const int b = itemStatTotal(sel, t);
+                if (a == 0 && b == 0) continue;
+                const int d = b - a;
+                setColor(sdl_, d > 0 ? Color{90, 210, 90}
+                                     : d < 0 ? Color{225, 90, 90} : Color{190, 190, 195});
+                const char* pct = affixIsPercent(t) ? "%" : "";
+                std::snprintf(line, sizeof(line), "  %-5s %d%s -> %d%s  %s%d%s", affixShortName(t),
+                              a, pct, b, pct, d > 0 ? "+" : "", d, pct);
+                SDL_RenderDebugText(sdl_, cx, cy, line);
+                cy += 11.0f;
+            }
+            // Weight — lighter is better, so the colour is inverted.
+            const float wa = hasCur ? equipped.weight : 0.0f, wb = sel.weight, dw = wb - wa;
+            setColor(sdl_, dw < -0.05f ? Color{90, 210, 90}
+                                       : dw > 0.05f ? Color{225, 90, 90} : Color{190, 190, 195});
+            std::snprintf(line, sizeof(line), "  %-5s %.1f -> %.1f kg", "Wt", wa, wb);
+            SDL_RenderDebugText(sdl_, cx, cy, line);
+            cy += 11.0f;
+            // Overall power score.
+            const int pa = hasCur ? itemPower(equipped) : 0, pb = itemPower(sel), dp = pb - pa;
+            setColor(sdl_, dp > 0 ? Color{90, 210, 90}
+                                  : dp < 0 ? Color{225, 90, 90} : Color{190, 190, 195});
+            std::snprintf(line, sizeof(line), "  %-5s %d -> %d  %s%d", "Pow", pa, pb,
+                          dp > 0 ? "+" : "", dp);
+            SDL_RenderDebugText(sdl_, cx, cy, line);
+            cy += 11.0f;
+            // Style swap is a play-style change, not just a number — flag it.
+            if (sel.slot == EquipSlot::MainHand && hasCur && sel.style != equipped.style) {
+                setColor(sdl_, 240, 200, 90);
+                const char* sn = sel.style == AttackStyle::Melee    ? "MELEE"
+                                 : sel.style == AttackStyle::Ranged ? "RANGED"
+                                                                    : "MAGIC";
+                std::snprintf(line, sizeof(line), "  ! becomes %s", sn);
+                SDL_RenderDebugText(sdl_, cx, cy, line);
+            }
+        }
+    }
+
+    setColor(sdl_, 200, 220, 245);
+    SDL_RenderDebugText(sdl_, x, screenH / 2.0f - 24.0f,
+                        "Up/Down: select   Enter: use/equip (drink potions)   V: sell   G: unequip");
+    setColor(sdl_, 240, 235, 200);
+    SDL_RenderDebugText(sdl_, x, screenH / 2.0f - 12.0f,
+                        "(1-9 quick-use   Q: quick-heal   move with WASD   Tab to close)");
     SDL_SetRenderScale(sdl_, 1.0f, 1.0f);
 }
 
@@ -926,9 +1151,9 @@ void Renderer::drawCharSheet(const World& world, int screenW, int screenH) {
         const Player& p = world.players[i];
         if (!p.active) continue;
         setColor(sdl_, playerColor(i));
-        std::snprintf(line, sizeof(line), "P%d  %s (%s)  Lv%d  XP %d/%d  points: %d", i + 1,
+        std::snprintf(line, sizeof(line), "P%d  %s (%s)  Lv%d  XP %d/%d  boons: %d", i + 1,
                       playerTitle(p), className(p.cls.id), p.level, p.xp, xpForLevel(p.level),
-                      p.unspentPoints);
+                      p.boons.count);
         SDL_RenderDebugText(sdl_, x, y, line);
         y += 12.0f;
         const int vals[5] = {p.stats.str, p.stats.dex, p.stats.intel, p.stats.vit, p.stats.agi};
@@ -939,17 +1164,28 @@ void Renderer::drawCharSheet(const World& world, int screenW, int screenH) {
         SDL_RenderDebugText(sdl_, x, y, line);
         y += 12.0f;
         setColor(sdl_, 170, 190, 210);
-        std::snprintf(line, sizeof(line), "   skills: Melee %d  Ranged %d  Heal %d  Dodge %d",
-                      p.skills.melee.level, p.skills.ranged.level, p.skills.heal.level,
-                      p.skills.dodge.level);
+        std::snprintf(line, sizeof(line),
+                      "   skills: Melee %d  Ranged %d  Arcane %d  Heal %d  Dodge %d",
+                      p.skills.melee.level, p.skills.ranged.level, p.skills.arcane.level,
+                      p.skills.heal.level, p.skills.dodge.level);
         SDL_RenderDebugText(sdl_, x, y, line);
-        y += 16.0f;
+        y += 12.0f;
+        // Mastery of the weapon in hand — what gates that weapon's spell discovery.
+        if (p.hasWeapon() && !p.weapon().weaponClass.empty()) {
+            setColor(sdl_, 200, 180, 120);
+            std::snprintf(line, sizeof(line), "   weapon mastery: %s Lv %d",
+                          p.weapon().weaponClass.c_str(),
+                          p.masteryOf(p.weapon().weaponClass));
+            SDL_RenderDebugText(sdl_, x, y, line);
+            y += 12.0f;
+        }
+        y += 4.0f;
     }
 
     y += 4.0f;
     setColor(sdl_, 200, 200, 210);
-    SDL_RenderDebugText(sdl_, x, y, "Spend a point:  keyboard 1=STR 2=DEX 3=INT 4=VIT 5=AGI");
-    SDL_RenderDebugText(sdl_, x, y + 12.0f, "Pad: D-pad up/down to pick, D-pad right to spend");
+    SDL_RenderDebugText(sdl_, x, y, "Stats grow automatically toward how you play (no menu to manage).");
+    SDL_RenderDebugText(sdl_, x, y + 12.0f, "Your build comes from the boons/abilities you draft on level-up.");
     SDL_RenderDebugText(sdl_, x, y + 28.0f, "(C to close - the world keeps running, so watch your back)");
     SDL_SetRenderScale(sdl_, 1.0f, 1.0f);
 }

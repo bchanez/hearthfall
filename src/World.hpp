@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cmath>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "Entity.hpp"
@@ -43,8 +45,30 @@ struct Skill {
 struct Skills {
     Skill melee;
     Skill ranged;
+    Skill arcane;  // rises by casting with a magic weapon (staff/wand) — INT combat
     Skill heal;
     Skill dodge;
+};
+
+// Per-run level-up boons: the accumulated bonuses from the "pick 1 of 3 on
+// level-up" choices. Separate from gear affixes (which come and go with
+// equipment) and from stat points (the long-term RPG growth) — this is the
+// survivor-like build layer that stacks toward the god fantasy. All are additive
+// and fold into the derived-stat helpers in PlayerStats.hpp / the combat code.
+struct Boons {
+    int damagePct = 0;         // +% attack damage
+    int attackSpeedPct = 0;    // +% attack speed
+    int moveSpeedPct = 0;      // +% move speed
+    int maxHpPct = 0;          // +% max HP
+    int critPct = 0;           // +% crit chance
+    int lifestealPct = 0;      // +% lifesteal
+    int spellPowerPct = 0;     // +% auto-cast ability damage (caster scaling)
+    int armorPct = 0;          // +% incoming damage reduction (the tanky build)
+    int extraProjectiles = 0;  // +N ranged bolts per shot
+    int pierce = 0;            // ranged bolts pass through +N enemies
+    int regen = 0;             // passive HP regenerated per second
+    int dodgePct = 0;          // +% chance to avoid an incoming hit
+    int count = 0;             // how many boons taken (for the HUD)
 };
 
 // One player character. Everything here is per-player; the bank (inventory +
@@ -62,15 +86,58 @@ struct Player {
     Stats stats;
     int unspentPoints = 0;
 
-    // Use-based mastery — rises as you perform the matching action.
+    // Use-based mastery — rises as you perform the matching action. These broad
+    // STYLE skills drive damage, the emergent title, stat drift and dodge/heal.
     Skills skills;
 
-    // Equipment drawn from the shared bank. When the player leaves, this gear
-    // flows back into the bank ("fluid loot").
-    bool hasWeapon = false;
-    Item weapon{};
-    bool hasArmor = false;
-    Item armor{};
+    // Per-weapon-class mastery (Mabinogi): each weapon FAMILY you swing ("sword",
+    // "axe", "staff"…) climbs on its own, independent of the style skill above.
+    // This is what gates spell discovery — pick up a fresh axe and you start its
+    // mastery at 1, so only its early spells are offered until you practise it.
+    // Keyed by Item::weaponClass. Not networked (shared-screen host owns it).
+    std::unordered_map<std::string, Skill> weaponSkills;
+
+    // Mastery level of a weapon family (1 if never trained; 0 for "no class").
+    int masteryOf(const std::string& cls) const {
+        if (cls.empty()) return 0;
+        auto it = weaponSkills.find(cls);
+        return it == weaponSkills.end() ? 1 : it->second.level;
+    }
+
+    // Per-run boons and the pending level-up choice. On level-up, pendingBoons is
+    // bumped and boonChoices is rolled with 3 upgrade-pool ids to pick from; the
+    // player's ChooseUpgrade command applies one and re-rolls or clears the offer.
+    Boons boons;
+    int pendingBoons = 0;                 // queued level-up choices awaiting a pick
+    int boonChoices[3] = {-1, -1, -1};    // the 3 currently-offered choice ids
+
+    // Auto-casting abilities drafted on level-up. Each fires on its own cooldown
+    // (no key press) and grows with rank (re-picking the same one ranks it up).
+    struct AbilityInst {
+        int specId = -1;      // index into GameContent::abilityPool
+        int rank = 1;         // stacks: re-picking the same ability raises this
+        float cooldown = 0.0f;  // seconds until the next auto-cast
+    };
+    std::vector<AbilityInst> abilities;
+
+    // Equipment drawn from the shared bank — the full paperdoll (see EquipSlot):
+    // two weapon hands, five armour pieces, three jewellery slots. Each is
+    // optional. When the player leaves, this gear flows back into the bank
+    // ("fluid loot"). Index with EquipSlot; the two ring slots are Ring1/Ring2.
+    struct Slot {
+        bool has = false;
+        Item item{};
+    };
+    Slot equipment[kEquipSlotCount];
+
+    Slot& slot(EquipSlot s) { return equipment[static_cast<int>(s)]; }
+    const Slot& slot(EquipSlot s) const { return equipment[static_cast<int>(s)]; }
+    bool hasEquip(EquipSlot s) const { return equipment[static_cast<int>(s)].has; }
+    const Item& equip(EquipSlot s) const { return equipment[static_cast<int>(s)].item; }
+
+    // The main-hand weapon defines how you fight (style + damage characteristic).
+    bool hasWeapon() const { return hasEquip(EquipSlot::MainHand); }
+    const Item& weapon() const { return equip(EquipSlot::MainHand); }
 
     Vec2 moveIntent{};
     Vec2 aim{1.0f, 0.0f};
@@ -94,6 +161,7 @@ struct Player {
     float invuln = 0.0f;
     float downedFlash = 0.0f;
     float potionCooldown = 0.0f;  // gate on chugging the whole bank at once
+    float regenBucket = 0.0f;     // accumulates fractional passive regen (Regen boon)
 
     bool active = true;  // inactive slots are hidden and skipped (e.g. pad unplugged)
 };
@@ -119,6 +187,13 @@ struct World {
     std::vector<Projectile> projectiles;
 
     int wave = 0;
+
+    // Hit-stop: seconds the whole simulation is frozen so a heavy hit or a kill
+    // lands with weight (the classic "juice" freeze-frame). Set by the damage
+    // path, bled down in Simulation::step, which advances nothing while it's >0.
+    // Purely a timing effect — snapshots simply stop changing, so clients see the
+    // freeze for free without any netcode change.
+    float hitStop = 0.0f;
 };
 
 // Concentric biome/difficulty ring radii, measured from the world centre. They

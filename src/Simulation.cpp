@@ -35,6 +35,14 @@ constexpr float kHitFlash = 0.09f;         // how long a struck enemy flashes wh
 constexpr float kKnockback = 260.0f;       // impulse speed imparted by a hit
 constexpr float kKnockbackDecay = 6.0f;    // per-second decay of the knockback push
 
+// Hit-stop: a brief whole-sim freeze on impact. This is what sells "weight" — the
+// game hangs for a few frames the instant a hit connects, then snaps back. Kept
+// short (a few frames at 60fps) so it reads as punch, not lag; capped so chained
+// AoE kills never lock the game up.
+constexpr float kHitStopBigKill = 0.11f;   // a boss/elite/alpha kill hangs the frame
+constexpr float kHitStopHeavyHit = 0.03f;  // a hit that takes a big bite of max HP
+constexpr float kHitStopMax = 0.13f;       // ceiling so multi-kills never freeze long
+
 // Wave / difficulty tuning.
 constexpr int kBossEveryNWaves = 5;
 constexpr float kHpScalePerWave = 0.08f;   // enemies get +8% HP per wave cleared
@@ -52,7 +60,6 @@ constexpr float kDmgScalePerLevel = 0.06f; // +6% contact damage per zone level 
 // (the class only sets the level-1 baseline); the point is what makes you
 // stronger, per the classless / Mabinogi-style specialization.
 constexpr int kXpPerKill = 20;
-constexpr int kPointsPerLevel = 1;
 constexpr int kHpPerVit = 8;     // max HP per VIT point
 constexpr int kDmgPerStat = 2;   // attack damage per point of the primary stat
 constexpr int kHealPerInt = 3;   // Mend heal per INT point
@@ -67,7 +74,6 @@ constexpr int kWhirlwindSkill = 5;  // Melee ≥ this → ability becomes Whirlw
 constexpr int kPowerShotSkill = 5;  // Ranged ≥ this → ability becomes Power Shot
 
 // Consumables.
-constexpr float kPotionHealPct = 0.5f;   // a potion restores half of max HP
 constexpr float kPotionCooldown = 1.0f;  // seconds between quaffs
 
 // Dash / dodge roll.
@@ -90,9 +96,6 @@ bool addStat(Stats& s, int idx) {
 
 // Aggro tuning.
 constexpr float kThreatDecayPerSec = 0.05f;  // gentle decay so aggro stays dynamic
-constexpr float kHealThreatFactor = 0.6f;    // healing draws aggro
-constexpr float kTauntBonus = 60.0f;         // Taunt puts the tank on top + this
-constexpr float kTauntRadius = 280.0f;
 
 // Behavioural aggro tuning.
 constexpr float kPackWakeRadius = 260.0f;      // an aggroed pack member wakes mates within this
@@ -113,10 +116,9 @@ constexpr std::size_t kMaxHoard = 6;           // cap on scavenged loot per pred
 
 float clampToZero(float v) { return v < 0.0f ? 0.0f : v; }
 
-// The tank grabs aggro; everyone else is baseline.
-float classThreatMultiplier(const PlayerClass& cls) {
-    return cls.id == ClassId::Tank ? 5.0f : 1.0f;
-}
+// Threat is uniform now that classes are gone — you hold aggro by dealing damage,
+// not by being "the tank". (Kept as a hook in case a threat boon returns.)
+float classThreatMultiplier(const PlayerClass&) { return 1.0f; }
 
 float threatOf(const Entity& enemy, int playerId) {
     if (playerId < 0 || playerId >= static_cast<int>(enemy.threat.size())) return 0.0f;
@@ -132,9 +134,10 @@ Simulation::Simulation(GameContent content) : content_(std::move(content)) {
     spawnWorldMobs();  // populate the outer world so exploration has stakes
 }
 
-const PlayerClass& Simulation::classAt(int index) const {
-    const int n = static_cast<int>(content_.classes.size());
-    return content_.classes[((index % n) + n) % n];
+const PlayerClass& Simulation::classAt(int /*index*/) const {
+    // Classless: everyone is the same neutral adventurer (the first kit). Identity
+    // comes from what you wield, pump and practise — not a picked class.
+    return content_.classes.front();
 }
 
 Item Simulation::lootRandom() {
@@ -195,29 +198,23 @@ void Simulation::initPlayer(int playerId, int classIndex, int level) {
     p.entity.hp = p.entity.maxHp;
 }
 
-void Simulation::reclass(int playerId, int classIndex) {
-    // Change class but keep the character's level/xp/position.
-    Player& p = world_.players[playerId];
-    p.cls = classAt(classIndex);
-    p.attackCooldown = 0.0f;
-    p.abilityCooldown = 0.0f;
-    p.shieldTimer = 0.0f;
-    recomputeStats(p);
-    p.entity.hp = p.entity.maxHp;
-}
-
 void Simulation::recomputeStats(Player& p) {
     // Class base = the level-1 baseline; VIT and gear stack on top.
-    p.entity.maxHp = p.cls.maxHp + p.stats.vit * kHpPerVit + gearMaxHp(p);
-    p.entity.speed = p.cls.speed * moveSpeedMul(p);  // affixes + AGI
+    // Base HP (class + VIT + gear), then the MaxHp boon scales the whole pool.
+    const int baseHp = p.cls.maxHp + p.stats.vit * kHpPerVit + gearMaxHp(p);
+    p.entity.maxHp = baseHp * (100 + p.boons.maxHpPct) / 100;
+    // Speed = class base, scaled up by affixes/AGI/boons, then down by the weight
+    // of the gear on your back (encumbrance) — heavy plate is a real trade-off.
+    p.entity.speed = p.cls.speed * moveSpeedMul(p) * encumbranceMul(p);
     if (p.entity.hp > p.entity.maxHp) p.entity.hp = p.entity.maxHp;
 }
 
 int Simulation::effectiveDamage(const Player& p) const {
     // Class base + the primary characteristic (STR melee / DEX ranged) + gear +
     // the mastery of the skill you're actually using (rises as you practise).
-    return p.cls.attackDamage + primaryDamageStat(p) * kDmgPerStat + gearDamage(p) +
-           activeAttackSkill(p);
+    const int base = p.cls.attackDamage + primaryDamageStat(p) * kDmgPerStat + gearDamage(p) +
+                     activeAttackSkill(p);
+    return base * (100 + p.boons.damagePct) / 100;  // Damage boon scales the total
 }
 
 void Simulation::allocStat(int playerId, int statIndex) {
@@ -231,6 +228,28 @@ void Simulation::allocStat(int playerId, int statIndex) {
     p.entity.hp += std::max(0, p.entity.maxHp - before);  // a VIT point grants its HP now
 }
 
+void Simulation::driftStat(Player& p) {
+    // Drift: on level-up your identity grows toward HOW you play — no menu to open.
+    // The characteristic behind your strongest skill climbs (melee→STR, ranged→DEX,
+    // arcane/heal→INT, dodge→AGI), plus a point of VIT so survivability keeps pace.
+    // What you practise is who you become; the big, varied bonuses come from boons.
+    int statIdx = 0;  // STR (melee) by default
+    int best = p.skills.melee.level;
+    if (p.skills.ranged.level > best) { best = p.skills.ranged.level; statIdx = 1; }  // DEX
+    if (p.skills.arcane.level > best) { best = p.skills.arcane.level; statIdx = 2; }  // INT
+    if (p.skills.heal.level > best)   { best = p.skills.heal.level;   statIdx = 2; }  // INT
+    if (p.skills.dodge.level > best)  { best = p.skills.dodge.level;  statIdx = 4; }  // AGI
+    addStat(p.stats, statIdx);
+    addStat(p.stats, 3);  // VIT: baseline HP growth every level
+    const int before = p.entity.maxHp;
+    recomputeStats(p);
+    p.entity.hp += std::max(0, p.entity.maxHp - before);
+}
+
+int Simulation::dodgePctFor(const Player& p) const {
+    return std::min(60, p.boons.dodgePct);  // capped so you can't become untouchable
+}
+
 void Simulation::gainSkill(Skill& s, int amount) {
     s.xp += amount;
     while (s.xp >= skillXpForLevel(s.level)) {
@@ -241,69 +260,154 @@ void Simulation::gainSkill(Skill& s, int amount) {
 
 void Simulation::autoAllocate(Player& p, int n) {
     if (n <= 0) return;
-    // Preferred stat order per class (indices into addStat) so a matched drop-in
-    // plays to its class's strengths without the player micromanaging.
-    static const int humanOrder[]  = {3, 0, 1, 4, 2};  // VIT, STR, DEX, AGI, INT (balanced)
-    static const int tankOrder[]   = {3, 0, 4, 1, 2};  // VIT, STR, AGI, DEX, INT
-    static const int archerOrder[] = {1, 4, 3, 0, 2};  // DEX, AGI, VIT, STR, INT
-    static const int healerOrder[] = {2, 3, 4, 1, 0};  // INT, VIT, AGI, DEX, STR
-    const int* order = p.cls.id == ClassId::Tank     ? tankOrder
-                       : p.cls.id == ClassId::Archer ? archerOrder
-                       : p.cls.id == ClassId::Healer ? healerOrder
-                                                     : humanOrder;
-    for (int i = 0; i < n; ++i) addStat(p.stats, order[i % 5]);
+    // A matched drop-in gets a balanced spread (VIT, STR, DEX, AGI, INT) — no class
+    // to bias it. Players still drift toward how they play via driftStat.
+    static const int balancedOrder[] = {3, 0, 1, 4, 2};
+    for (int i = 0; i < n; ++i) addStat(p.stats, balancedOrder[i % 5]);
+}
+
+EquipSlot Simulation::landingSlot(const Player& p, const Item& it) const {
+    const EquipSlot s = resolvedSlot(it);
+    // A ring fills the first free finger; both taken → it replaces Ring1.
+    if (s == EquipSlot::Ring1)
+        return (p.hasEquip(EquipSlot::Ring1) && !p.hasEquip(EquipSlot::Ring2)) ? EquipSlot::Ring2
+                                                                               : EquipSlot::Ring1;
+    // A second 1H weapon over a 1H main hand (with a free off-hand) dual-wields.
+    if (s == EquipSlot::MainHand && it.hands == 1 && p.hasEquip(EquipSlot::MainHand) &&
+        p.equip(EquipSlot::MainHand).hands == 1 && !p.hasEquip(EquipSlot::OffHand))
+        return EquipSlot::OffHand;
+    return s;
+}
+
+void Simulation::equipResolved(Player& p, const Item& raw) {
+    // Normalise: fill in a slot for items built without one (tests/legacy) and
+    // default a weapon to one-handed so the wield rules always have real data.
+    Item picked = raw;
+    picked.slot = resolvedSlot(picked);
+    if (picked.kind == ItemKind::Weapon && picked.hands == 0) picked.hands = 1;
+
+    // Send whatever is in a slot back to the shared bank and clear it.
+    auto stash = [&](EquipSlot s) {
+        if (p.hasEquip(s)) {
+            world_.inventory.tryAdd(p.slot(s).item);
+            p.slot(s) = Player::Slot{};
+        }
+    };
+    auto place = [&](EquipSlot s, const Item& it) { p.slot(s) = Player::Slot{true, it}; };
+
+    switch (picked.slot) {
+        case EquipSlot::MainHand:
+            if (picked.hands >= 2) {  // two-hander claims both hands
+                stash(EquipSlot::OffHand);
+                stash(EquipSlot::MainHand);
+                place(EquipSlot::MainHand, picked);
+            } else if (!p.hasEquip(EquipSlot::MainHand)) {
+                place(EquipSlot::MainHand, picked);
+            } else if (p.equip(EquipSlot::MainHand).hands == 1 && !p.hasEquip(EquipSlot::OffHand)) {
+                place(EquipSlot::OffHand, picked);  // dual wield into the free hand
+            } else {
+                stash(EquipSlot::MainHand);
+                place(EquipSlot::MainHand, picked);
+            }
+            break;
+        case EquipSlot::OffHand:
+            // A shield/focus/off-hand weapon needs a free hand: a two-hander in the
+            // main hand must come off first.
+            if (p.hasEquip(EquipSlot::MainHand) && p.equip(EquipSlot::MainHand).hands >= 2)
+                stash(EquipSlot::MainHand);
+            stash(EquipSlot::OffHand);
+            place(EquipSlot::OffHand, picked);
+            break;
+        case EquipSlot::Ring1: {
+            const EquipSlot dst = landingSlot(p, picked);
+            stash(dst);
+            place(dst, picked);
+            break;
+        }
+        case EquipSlot::None:
+            world_.inventory.tryAdd(picked);  // not equippable — belt and braces
+            return;
+        default:  // Head/Chest/Hands/Legs/Feet/Amulet: a plain one-per-slot swap
+            stash(picked.slot);
+            place(picked.slot, picked);
+            break;
+    }
+
+    // Gear can raise max HP; grant the gained HP now so equipping feels rewarding.
+    const int before = p.entity.maxHp;
+    recomputeStats(p);
+    p.entity.hp += std::max(0, p.entity.maxHp - before);
 }
 
 void Simulation::equipBest(int playerId) {
-    equipBestOfKind(playerId, ItemKind::Weapon);
-    equipBestOfKind(playerId, ItemKind::Armor);
-}
-
-void Simulation::equipBestOfKind(int playerId, ItemKind kind) {
+    if (playerId < 0 || playerId >= static_cast<int>(world_.players.size())) return;
     Player& p = world_.players[playerId];
-    const bool isWeapon = kind == ItemKind::Weapon;
-    const int current = isWeapon ? (p.hasWeapon ? p.weapon.bonusDamage : -1)
-                                 : (p.hasArmor ? p.armor.bonusMaxHp : -1);
-
-    // Find the best matching item in the bank that beats what's equipped.
-    const auto& items = world_.inventory.items();
-    int bestIdx = -1;
-    int bestVal = current;
-    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
-        if (items[i].kind != kind) continue;
-        const int v = isWeapon ? items[i].bonusDamage : items[i].bonusMaxHp;
-        if (v > bestVal) {
-            bestVal = v;
-            bestIdx = i;
+    if (!p.active) return;
+    // Greedily equip the single most-improving bank item, then repeat. Each equip
+    // strictly raises the slot's power, so this terminates. Fluid loot: displaced
+    // gear returns to the bank and can itself be re-picked for another slot.
+    for (bool improved = true; improved;) {
+        improved = false;
+        const auto& items = world_.inventory.items();
+        int bestIdx = -1, bestGain = 0;
+        for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+            const Item& it = items[i];
+            if (resolvedSlot(it) == EquipSlot::None) continue;  // gold/potions/junk
+            const EquipSlot dst = landingSlot(p, it);
+            const int cur = p.hasEquip(dst) ? itemPower(p.equip(dst)) : 0;
+            const int gain = itemPower(it) - cur;
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIdx = i;
+            }
+        }
+        if (bestIdx >= 0) {
+            const Item picked = world_.inventory.items()[bestIdx];
+            world_.inventory.removeAt(static_cast<std::size_t>(bestIdx));
+            equipResolved(p, picked);
+            improved = true;
         }
     }
-    if (bestIdx < 0) return;  // nothing better available
+}
 
-    const Item picked = items[bestIdx];
-    world_.inventory.removeAt(static_cast<std::size_t>(bestIdx));
-    if (isWeapon) {
-        if (p.hasWeapon) world_.inventory.tryAdd(p.weapon);  // old gear returns to the pool
-        p.weapon = picked;
-        p.hasWeapon = true;
-    } else {
-        if (p.hasArmor) world_.inventory.tryAdd(p.armor);
-        p.armor = picked;
-        p.hasArmor = true;
+void Simulation::equipItemAt(int playerId, int bankIndex) {
+    if (playerId < 0 || playerId >= static_cast<int>(world_.players.size())) return;
+    Player& p = world_.players[playerId];
+    if (!p.active) return;
+    const auto& items = world_.inventory.items();
+    if (bankIndex < 0 || bankIndex >= static_cast<int>(items.size())) return;
+    const Item picked = items[bankIndex];
+    // "Use" the selected item: a potion is drunk in place, gear is equipped. This
+    // makes Enter/number on a potion in the bank do the intuitive thing (heal).
+    if (picked.kind == ItemKind::Potion) {
+        drinkPotionAt(playerId, bankIndex);
+        return;
     }
-    recomputeStats(p);
+    if (resolvedSlot(picked) == EquipSlot::None) return;  // not equippable
+    // Take it out first (frees its weight), then place it — displaced pieces flow
+    // back into the shared pool (fluid loot).
+    world_.inventory.removeAt(static_cast<std::size_t>(bankIndex));
+    equipResolved(p, picked);
+}
+
+void Simulation::sellItemAt(int bankIndex) {
+    // Sell a bank item for its gold value (shared bank → shared gold). Gear only —
+    // gold/potions aren't "sold". Unequip first (G) to sell something you're wearing.
+    const auto& items = world_.inventory.items();
+    if (bankIndex < 0 || bankIndex >= static_cast<int>(items.size())) return;
+    const Item& it = items[bankIndex];
+    world_.gold += std::max(1, it.value) * std::max(1, it.count);  // whole stack sells
+    world_.inventory.removeAt(static_cast<std::size_t>(bankIndex));
 }
 
 void Simulation::unequip(int playerId) {
+    if (playerId < 0 || playerId >= static_cast<int>(world_.players.size())) return;
     Player& p = world_.players[playerId];
-    if (p.hasWeapon) {
-        world_.inventory.tryAdd(p.weapon);
-        p.hasWeapon = false;
-        p.weapon = Item{};
-    }
-    if (p.hasArmor) {
-        world_.inventory.tryAdd(p.armor);
-        p.hasArmor = false;
-        p.armor = Item{};
+    // Strip every paperdoll slot back into the shared bank.
+    for (int i = 0; i < kEquipSlotCount; ++i) {
+        if (!p.equipment[i].has) continue;
+        world_.inventory.tryAdd(p.equipment[i].item);
+        p.equipment[i] = Player::Slot{};
     }
     recomputeStats(p);
 }
@@ -324,8 +428,244 @@ void Simulation::awardXp(int playerId, int amount) {
     while (p.xp >= xpForLevel(p.level)) {
         p.xp -= xpForLevel(p.level);
         ++p.level;
-        p.unspentPoints += kPointsPerLevel;  // you choose where the growth goes
-        p.entity.hp = p.entity.maxHp;         // level-up fully heals — a reward moment
+        driftStat(p);                  // identity auto-grows toward how you play (no menu)
+        ++p.pendingBoons;              // and you draft a build-defining boon / ability (1 of 3)
+        p.entity.hp = p.entity.maxHp;  // level-up fully heals — a reward moment
+    }
+    // If a choice is now open and none is showing yet, roll the 3 offers.
+    if (p.pendingBoons > 0 && p.boonChoices[0] < 0) rollBoonChoices(p);
+}
+
+void Simulation::rollBoonChoices(Player& p) {
+    // The offer is a COMBINED space: ids [0, boonCount) are passive boons; ids from
+    // boonCount up are auto-cast abilities. A spell is only eligible if it belongs
+    // to the weapon you're WIELDING right now (its weaponClass) AND you've trained
+    // that weapon to its mastery gate — so each weapon discovers its own spells the
+    // more you play it. Passive boons are always eligible. Deterministic via PRNG.
+    p.boonChoices[0] = p.boonChoices[1] = p.boonChoices[2] = -1;
+    const int boonCount = static_cast<int>(content_.upgradePool.size());
+    const AttackStyle style = effectiveStyle(p);
+    const std::string wclass = p.hasWeapon() ? p.weapon().weaponClass : std::string();
+    // Gate on the WIELDED weapon's own mastery (per-class), falling back to the
+    // broad style skill when unarmed or the weapon has no class.
+    const int mastery = !wclass.empty() ? p.masteryOf(wclass) : activeAttackSkill(p);
+
+    std::vector<int> eligible;
+    for (int i = 0; i < boonCount; ++i) eligible.push_back(i);  // boons: always offered
+    for (int i = 0; i < static_cast<int>(content_.abilityPool.size()); ++i) {
+        const AbilitySpec& spec = content_.abilityPool[i];
+        if (abilityMatchesWeapon(spec, style, wclass) && mastery >= spec.minSkill)
+            eligible.push_back(boonCount + i);  // ability ids live above the boons
+    }
+    if (eligible.empty()) return;
+
+    const int want = std::min(3, static_cast<int>(eligible.size()));
+    int filled = 0, guard = 0;
+    while (filled < want && guard++ < 200) {
+        const int id = eligible[nextRand() % static_cast<uint32_t>(eligible.size())];
+        bool dup = false;
+        for (int i = 0; i < filled; ++i)
+            if (p.boonChoices[i] == id) dup = true;
+        if (!dup) p.boonChoices[filled++] = id;
+    }
+}
+
+void Simulation::chooseUpgrade(int playerId, int slot) {
+    if (playerId < 0 || playerId >= static_cast<int>(world_.players.size())) return;
+    Player& p = world_.players[playerId];
+    if (!p.active || p.pendingBoons <= 0) return;
+    if (slot < 0 || slot > 2) return;
+    const int id = p.boonChoices[slot];
+    const int boonCount = static_cast<int>(content_.upgradePool.size());
+    const int total = boonCount + static_cast<int>(content_.abilityPool.size());
+    if (id < 0 || id >= total) return;
+
+    if (id >= boonCount) {
+        // An ability offer: grant it (or rank it up if already owned).
+        grantAbility(p, id - boonCount);
+    } else {
+        const UpgradeSpec& up = content_.upgradePool[id];
+        const int m = up.magnitude;
+        switch (up.effect) {
+            case UpgradeEffect::DamagePct:      p.boons.damagePct += m; break;
+            case UpgradeEffect::AttackSpeedPct: p.boons.attackSpeedPct += m; break;
+            case UpgradeEffect::MoveSpeedPct:   p.boons.moveSpeedPct += m; break;
+            case UpgradeEffect::MaxHpPct:       p.boons.maxHpPct += m; break;
+            case UpgradeEffect::CritPct:        p.boons.critPct += m; break;
+            case UpgradeEffect::LifestealPct:   p.boons.lifestealPct += m; break;
+            case UpgradeEffect::MultiShot:      p.boons.extraProjectiles += m; break;
+            case UpgradeEffect::Pierce:         p.boons.pierce += m; break;
+            case UpgradeEffect::Regen:          p.boons.regen += m; break;
+            case UpgradeEffect::Dodge:          p.boons.dodgePct += m; break;
+            case UpgradeEffect::SpellPowerPct:  p.boons.spellPowerPct += m; break;
+            case UpgradeEffect::ArmorPct:       p.boons.armorPct += m; break;
+        }
+    }
+    ++p.boons.count;
+    --p.pendingBoons;
+
+    // A MaxHp boon should feel like a reward *now*: recompute and grant the gained HP.
+    const int before = p.entity.maxHp;
+    recomputeStats(p);
+    p.entity.hp += std::max(0, p.entity.maxHp - before);
+
+    // Show the next offer, or clear the box when there's nothing left to pick.
+    if (p.pendingBoons > 0) rollBoonChoices(p);
+    else p.boonChoices[0] = p.boonChoices[1] = p.boonChoices[2] = -1;
+}
+
+void Simulation::grantAbility(Player& p, int abilityId) {
+    if (abilityId < 0 || abilityId >= static_cast<int>(content_.abilityPool.size())) return;
+    for (auto& a : p.abilities)
+        if (a.specId == abilityId) {
+            ++a.rank;  // already owned → stack it stronger
+            return;
+        }
+    p.abilities.push_back({abilityId, 1, 0.0f});  // ready to fire immediately
+}
+
+int Simulation::nearestEnemyIndex(const Vec2& from) const {
+    int best = -1;
+    float bestSq = 0.0f;
+    for (int i = 0; i < static_cast<int>(world_.enemies.size()); ++i) {
+        const Entity& e = world_.enemies[i];
+        if (!e.alive) continue;
+        const float d = distanceSquared(from, e.position);
+        if (best < 0 || d < bestSq) {
+            best = i;
+            bestSq = d;
+        }
+    }
+    return best;
+}
+
+void Simulation::updateAbilities(Player& p, int playerId, float dt) {
+    if (p.abilities.empty()) return;
+    // Only auto-cast when there's something to hit, so cooldowns don't idle away
+    // between waves.
+    bool anyEnemy = false;
+    for (const auto& e : world_.enemies)
+        if (e.alive) {
+            anyEnemy = true;
+            break;
+        }
+    for (auto& a : p.abilities) {
+        if (a.specId < 0 || a.specId >= static_cast<int>(content_.abilityPool.size())) continue;
+        a.cooldown = clampToZero(a.cooldown - dt);
+        if (a.cooldown > 0.0f || !anyEnemy) continue;
+        const AbilitySpec& spec = content_.abilityPool[a.specId];
+        castAbility(p, playerId, spec, a.rank);
+        // Higher rank fires a touch faster, down to a floor so it never machine-guns.
+        a.cooldown = std::max(0.4f, spec.cooldown * (1.0f - 0.06f * static_cast<float>(a.rank - 1)));
+    }
+}
+
+void Simulation::applyAbilityStatus(Entity& enemy, AbilityStatus st, float dur, int power,
+                                    const Vec2& dir) {
+    constexpr float kAbilityKnockback = 720.0f;  // shove of a Knock rider
+    switch (st) {
+        case AbilityStatus::Burn:
+            enemy.burnTime = std::max(enemy.burnTime, dur);
+            enemy.burnDps = std::max(enemy.burnDps, power);
+            break;
+        case AbilityStatus::Slow: enemy.slowTime = std::max(enemy.slowTime, dur); break;
+        case AbilityStatus::Stun: enemy.stunTime = std::max(enemy.stunTime, dur); break;
+        case AbilityStatus::Knock: enemy.knockback = dir * kAbilityKnockback; break;
+        case AbilityStatus::None: break;
+    }
+}
+
+void Simulation::castAbility(Player& p, int playerId, const AbilitySpec& spec, int rank) {
+    const int base = effectiveDamage(p) / 2;  // abilities scale partly with your build
+    // Spell power lifts every ability above its base magnitude — a staff/focus/INT
+    // caster hits far harder than the raw numbers (Phase 2 caster scaling).
+    const int sp = spellPowerPct(p);
+    auto amp = [sp](int dmg) { return dmg * (100 + sp) / 100; };
+    // A projectile carries its spell's status rider so it lands the effect on hit.
+    auto tag = [&](Projectile& b) {
+        b.statusType = static_cast<int>(spec.status);
+        b.statusDur = spec.statusDur;
+        b.statusPower = spec.statusPower;
+    };
+    switch (spec.effect) {
+        case AbilityEffect::Nova: {
+            const float radius = p.entity.radius + 70.0f + 12.0f * static_cast<float>(rank);
+            const float radiusSq = radius * radius;
+            const int dmg = amp(spec.magnitude * rank + base);
+            for (auto& enemy : world_.enemies) {
+                if (!enemy.alive) continue;
+                if (distanceSquared(p.entity.position, enemy.position) > radiusSq) continue;
+                const Vec2 dir = (enemy.position - p.entity.position).normalized();
+                hurtEnemy(enemy, dmg, dir, playerId, static_cast<float>(dmg));
+                applyAbilityStatus(enemy, spec.status, spec.statusDur, spec.statusPower, dir);
+            }
+            p.attackFlash = std::max(p.attackFlash, 0.12f);
+            break;
+        }
+        case AbilityEffect::Volley: {
+            const int n = std::max(1, spec.magnitude + (rank - 1) * 2);
+            const int dmg = amp(base + rank * 4);
+            for (int i = 0; i < n; ++i) {
+                const float ang = 6.2831853f * static_cast<float>(i) / static_cast<float>(n);
+                Projectile bolt;
+                bolt.position = p.entity.position;
+                bolt.velocity = Vec2{std::cos(ang), std::sin(ang)} * kProjectileSpeed;
+                bolt.damage = dmg;
+                bolt.radius = 6.0f;
+                bolt.life = kRangedWeaponRange / kProjectileSpeed;
+                bolt.owner = playerId;
+                tag(bolt);
+                world_.projectiles.push_back(bolt);
+            }
+            break;
+        }
+        case AbilityEffect::Bolt: {
+            const int idx = nearestEnemyIndex(p.entity.position);
+            if (idx < 0) break;
+            const Vec2 dir = (world_.enemies[idx].position - p.entity.position).normalized();
+            Projectile bolt;
+            bolt.position = p.entity.position;
+            bolt.velocity = dir * kProjectileSpeed;
+            bolt.damage = amp(spec.magnitude * rank + base);
+            bolt.radius = 8.0f;
+            bolt.life = kRangedWeaponRange / kProjectileSpeed;
+            bolt.owner = playerId;
+            tag(bolt);
+            world_.projectiles.push_back(bolt);
+            break;
+        }
+        case AbilityEffect::Chain: {
+            // Lightning: strike the nearest foe, then leap to the nearest not-yet-hit
+            // enemy within range, up to a jump count that grows with rank. Damage
+            // falls off a little per jump. Instant + juicy (hit-flash on each link).
+            constexpr float kChainRange = 220.0f;
+            const int jumps = 3 + (rank - 1) + spec.magnitude / 12;
+            int dmg = amp(spec.magnitude * rank + base);
+            Vec2 from = p.entity.position;
+            std::vector<int> hit;
+            for (int j = 0; j < jumps; ++j) {
+                int best = -1;
+                float bestSq = kChainRange * kChainRange;
+                for (int i = 0; i < static_cast<int>(world_.enemies.size()); ++i) {
+                    const Entity& e = world_.enemies[i];
+                    if (!e.alive) continue;
+                    if (std::find(hit.begin(), hit.end(), i) != hit.end()) continue;
+                    const float d = distanceSquared(from, e.position);
+                    if (d <= bestSq) { bestSq = d; best = i; }
+                }
+                if (best < 0) break;
+                Entity& e = world_.enemies[best];
+                const Vec2 dir = (e.position - from).normalized();
+                hurtEnemy(e, dmg, dir, playerId, static_cast<float>(dmg));
+                applyAbilityStatus(e, spec.status, spec.statusDur, spec.statusPower, dir);
+                e.hitFlash = std::max(e.hitFlash, 0.14f);
+                hit.push_back(best);
+                from = e.position;
+                dmg = std::max(1, dmg * 4 / 5);  // -20% per link
+            }
+            p.attackFlash = std::max(p.attackFlash, 0.12f);
+            break;
+        }
     }
 }
 
@@ -545,8 +885,7 @@ void Simulation::applyCommand(const Command& cmd) {
             if (cmd.dir.length() > 0.0f) p.aim = cmd.dir.normalized();
             break;
         case CommandType::SelectClass:
-            reclass(cmd.playerId, cmd.classIndex);
-            break;
+            break;  // classless: no class to pick (kept for wire/command compat)
         case CommandType::Equip:
             equipBest(cmd.playerId);
             break;
@@ -563,10 +902,26 @@ void Simulation::applyCommand(const Command& cmd) {
         case CommandType::AllocStat:
             allocStat(cmd.playerId, cmd.classIndex);  // classIndex carries the stat index
             break;
+        case CommandType::ChooseUpgrade:
+            chooseUpgrade(cmd.playerId, cmd.classIndex);  // classIndex carries the offer slot
+            break;
+        case CommandType::EquipItem:
+            equipItemAt(cmd.playerId, cmd.classIndex);  // classIndex carries the bank index
+            break;
+        case CommandType::SellItem:
+            sellItemAt(cmd.classIndex);  // classIndex carries the bank index
+            break;
     }
 }
 
 void Simulation::step(float dt) {
+    // Hit-stop: while frozen we bleed the timer down and advance nothing else, so
+    // the impact that set it hangs on screen for a few frames before play resumes.
+    if (world_.hitStop > 0.0f) {
+        world_.hitStop = clampToZero(world_.hitStop - dt);
+        return;
+    }
+
     for (int i = 0; i < static_cast<int>(world_.players.size()); ++i) {
         Player& p = world_.players[i];
         if (!p.active) continue;
@@ -578,6 +933,7 @@ void Simulation::step(float dt) {
         updatePlayer(p, dt);
         if (p.attackQueued) performAttack(i);
         if (p.abilityQueued) performAbility(i);
+        updateAbilities(p, i, dt);  // drafted auto-cast abilities fire on their cooldowns
     }
 
     updateProjectiles(dt);
@@ -614,6 +970,16 @@ void Simulation::advancePlayerTimers(Player& p, float dt) {
     p.potionCooldown = clampToZero(p.potionCooldown - dt);
     p.dashTimer = clampToZero(p.dashTimer - dt);
     p.dashCooldown = clampToZero(p.dashCooldown - dt);
+
+    // Passive regeneration (Regen boon): heal fractional HP per second, banked in a
+    // bucket so a small per-second value still adds up at a fixed timestep.
+    if (p.boons.regen > 0 && p.entity.hp > 0 && p.entity.hp < p.entity.maxHp) {
+        p.regenBucket += static_cast<float>(p.boons.regen) * dt;
+        while (p.regenBucket >= 1.0f && p.entity.hp < p.entity.maxHp) {
+            ++p.entity.hp;
+            p.regenBucket -= 1.0f;
+        }
+    }
 }
 
 void Simulation::updatePlayer(Player& p, float dt) {
@@ -678,9 +1044,14 @@ void Simulation::performAttack(int playerId) {
     // The equipped weapon decides how you fight; unarmed falls back to the class
     // style. Ranged reach comes from the weapon (long) or the class's unarmed poke.
     const AttackStyle style = effectiveStyle(p);
-    const float range = p.hasWeapon ? (style == AttackStyle::Ranged ? kRangedWeaponRange
+    const float range = p.hasWeapon() ? (style == AttackStyle::Ranged ? kRangedWeaponRange
                                                                      : kMeleeWeaponRange)
                                      : cls.attackRange;
+
+    // Per-weapon mastery (Mabinogi): the specific weapon family you're swinging
+    // climbs, gating that weapon's spell discovery independently of the style.
+    if (p.hasWeapon() && !p.weapon().weaponClass.empty())
+        gainSkill(p.weaponSkills[p.weapon().weaponClass], kSkillXpMeleeHit);
 
     if (style == AttackStyle::Melee) {
         p.attackFlash = 0.12f;
@@ -696,16 +1067,28 @@ void Simulation::performAttack(int playerId) {
         return;
     }
 
-    // Ranged: fire a bolt toward the aim direction.
-    gainSkill(p.skills.ranged, kSkillXpRangedShot);  // practise the bow
-    Projectile bolt;
-    bolt.position = p.entity.position;
-    bolt.velocity = p.aim * kProjectileSpeed;
-    bolt.damage = damage;
-    bolt.radius = 6.0f;
-    bolt.life = range / kProjectileSpeed;
-    bolt.owner = playerId;
-    world_.projectiles.push_back(bolt);
+    // Ranged & magic both fire toward the aim. The MultiShot boon adds bolts, fanned
+    // symmetrically around the aim; the Pierce boon lets each pass through enemies.
+    // Practise the matching mastery: a bow trains Ranged, a wand/staff trains
+    // Arcane — the casting skill that gates magic spell discovery.
+    gainSkill(style == AttackStyle::Magic ? p.skills.arcane : p.skills.ranged, kSkillXpRangedShot);
+    const int bolts = 1 + std::max(0, p.boons.extraProjectiles);
+    constexpr float kFanStep = 0.12f;  // radians between adjacent bolts in the fan
+    for (int i = 0; i < bolts; ++i) {
+        // Centre the fan on the aim: offsets -(n-1)/2 .. +(n-1)/2 times the step.
+        const float off = (static_cast<float>(i) - static_cast<float>(bolts - 1) * 0.5f) * kFanStep;
+        const float c = std::cos(off), s = std::sin(off);
+        const Vec2 dir{p.aim.x * c - p.aim.y * s, p.aim.x * s + p.aim.y * c};
+        Projectile bolt;
+        bolt.position = p.entity.position;
+        bolt.velocity = dir * kProjectileSpeed;
+        bolt.damage = damage;
+        bolt.radius = 6.0f;
+        bolt.life = range / kProjectileSpeed;
+        bolt.owner = playerId;
+        bolt.pierce = std::max(0, p.boons.pierce);
+        world_.projectiles.push_back(bolt);
+    }
 }
 
 void Simulation::performAbility(int playerId) {
@@ -746,75 +1129,41 @@ void Simulation::performAbility(int playerId) {
         return;
     }
 
-    switch (cls.id) {
-        case ClassId::Human: {
-            // Second Wind: a modest self-heal — the neutral starter's safety net.
-            const int heal = p.entity.maxHp / 4 + p.stats.intel * kHealPerInt + p.skills.heal.level;
-            p.entity.hp = std::min(p.entity.maxHp, p.entity.hp + heal);
-            p.healFlash = 0.35f;
-            gainSkill(p.skills.heal, kSkillXpHeal);
-            break;
-        }
-        case ClassId::Tank: {
-            // Taunt: yank aggro onto the tank for nearby enemies, + brief shield.
-            const float radiusSq = kTauntRadius * kTauntRadius;
-            for (auto& enemy : world_.enemies) {
-                if (!enemy.alive) continue;
-                if (distanceSquared(p.entity.position, enemy.position) > radiusSq) continue;
-                float top = 0.0f;
-                for (int i = 0; i < static_cast<int>(world_.players.size()); ++i)
-                    top = std::max(top, threatOf(enemy, i));
-                if (static_cast<int>(enemy.threat.size()) <= playerId)
-                    enemy.threat.resize(playerId + 1, 0.0f);
-                enemy.threat[playerId] = top + kTauntBonus;
-            }
-            p.shieldTimer = 3.0f;
-            break;
-        }
-        case ClassId::Archer: {
-            Projectile bolt;  // Power Shot: big, fast, heavy-hitting bolt
-            bolt.position = p.entity.position;
-            bolt.velocity = p.aim * kPowerShotSpeed;
-            bolt.damage = effectiveDamage(p) * 3;
-            bolt.radius = 11.0f;
-            bolt.life = (cls.attackRange * 1.3f) / kPowerShotSpeed;
-            bolt.owner = playerId;
-            world_.projectiles.push_back(bolt);
-            break;
-        }
-        case ClassId::Healer: {
-            // Mend: heal a chunk of max HP, boosted by INT + Heal mastery. Draws aggro.
-            const int heal =
-                p.entity.maxHp * 2 / 5 + p.stats.intel * kHealPerInt + p.skills.heal.level * 2;
-            p.entity.hp = std::min(p.entity.maxHp, p.entity.hp + heal);
-            p.healFlash = 0.35f;
-            gainSkill(p.skills.heal, kSkillXpHeal);
-            for (auto& enemy : world_.enemies) {
-                if (enemy.alive) addThreat(enemy, playerId, heal * kHealThreatFactor);
-            }
-            break;
+    // Below the mastery threshold, the manual ability is a neutral safety net for
+    // everyone — Second Wind, a modest self-heal scaling with INT + Heal mastery.
+    // (Classless: your damage comes from weapons + drafted spells, not a class move.)
+    const int heal = p.entity.maxHp / 4 + p.stats.intel * kHealPerInt + p.skills.heal.level;
+    p.entity.hp = std::min(p.entity.maxHp, p.entity.hp + heal);
+    p.healFlash = 0.35f;
+    gainSkill(p.skills.heal, kSkillXpHeal);
+}
+
+void Simulation::performUsePotion(int playerId) {
+    // Quick-heal (Q / LB): drink the FIRST potion in the shared bank.
+    const auto& items = world_.inventory.items();
+    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+        if (items[i].kind == ItemKind::Potion) {
+            drinkPotionAt(playerId, i);
+            return;
         }
     }
 }
 
-void Simulation::performUsePotion(int playerId) {
+void Simulation::drinkPotionAt(int playerId, int idx) {
+    if (playerId < 0 || playerId >= static_cast<int>(world_.players.size())) return;
     Player& p = world_.players[playerId];
+    if (!p.active) return;
     if (p.potionCooldown > 0.0f) return;
     if (p.entity.hp >= p.entity.maxHp) return;  // don't waste a potion at full HP
-
-    // Pull the first potion out of the shared bank.
     const auto& items = world_.inventory.items();
-    int idx = -1;
-    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
-        if (items[i].kind == ItemKind::Potion) {
-            idx = i;
-            break;
-        }
-    }
-    if (idx < 0) return;  // none carried
+    if (idx < 0 || idx >= static_cast<int>(items.size())) return;
+    if (items[idx].kind != ItemKind::Potion) return;
 
-    world_.inventory.removeAt(static_cast<std::size_t>(idx));
-    const int heal = std::max(1, static_cast<int>(p.entity.maxHp * kPotionHealPct));
+    // Heal scales with the potion's rarity — a rarer vial mends more.
+    const int pct = potionHealPercent(items[idx].rarity);
+    const int heal = std::max(1, p.entity.maxHp * pct / 100);
+    world_.inventory.consumeOne(static_cast<std::size_t>(idx));  // one from the stack
+
     p.entity.hp = std::min(p.entity.maxHp, p.entity.hp + heal);
     p.healFlash = 0.35f;  // reuse the heal juice
     p.potionCooldown = kPotionCooldown;
@@ -835,6 +1184,12 @@ void Simulation::updateProjectiles(float dt) {
                 if (!p.active || p.invuln > 0.0f) continue;
                 const float r = bolt.radius + p.entity.radius;
                 if (distanceSquared(bolt.position, p.entity.position) > r * r) continue;
+                // Dodge boon: a roll can slip the bolt (it still fizzles on contact).
+                const int dodge = dodgePctFor(p);
+                if (dodge > 0 && static_cast<int>(nextRand() % 100) < dodge) {
+                    bolt.alive = false;
+                    break;
+                }
                 p.entity.hp -= bolt.damage;
                 p.entity.hitFlash = std::max(p.entity.hitFlash, 0.1f);
                 bolt.alive = false;
@@ -848,11 +1203,18 @@ void Simulation::updateProjectiles(float dt) {
         }
         for (auto& enemy : world_.enemies) {
             if (!enemy.alive) continue;
+            if (enemy.id == bolt.lastHit) continue;  // don't re-hit the one we're passing through
             const float r = bolt.radius + enemy.radius;
             if (distanceSquared(bolt.position, enemy.position) > r * r) continue;
             hurtEnemy(enemy, bolt.damage, bolt.velocity.normalized(), bolt.owner,
                       static_cast<float>(bolt.damage));
-            bolt.alive = false;
+            if (bolt.statusType != 0)  // ability bolts land their rider on hit
+                applyAbilityStatus(enemy, static_cast<AbilityStatus>(bolt.statusType),
+                                   bolt.statusDur, bolt.statusPower, bolt.velocity.normalized());
+            bolt.lastHit = enemy.id;
+            // Pierce boon: spend one pass-through instead of dying, and fly on.
+            if (bolt.pierce > 0) --bolt.pierce;
+            else bolt.alive = false;
             break;
         }
     }
@@ -976,6 +1338,7 @@ void Simulation::tickStatus(Entity& e, float dt) {
         e.dotAccum += static_cast<float>(e.poisonDps) * dt;
     }
     if (e.slowTime > 0.0f) e.slowTime = clampToZero(e.slowTime - dt);
+    if (e.stunTime > 0.0f) e.stunTime = clampToZero(e.stunTime - dt);
     if (e.dotAccum >= 1.0f) {  // apply whole points of accumulated damage-over-time
         const int dmg = static_cast<int>(e.dotAccum);
         e.dotAccum -= static_cast<float>(dmg);
@@ -994,6 +1357,7 @@ void Simulation::applyStatusToPlayer(Player& p, const Entity& source) {
 void Simulation::enemyRangedAct(Entity& enemy, int target, float dt, bool& holdPosition) {
     holdPosition = false;
     if (target < 0) return;
+    if (enemy.stunTime > 0.0f) return;  // stunned casters can't fire or wind up
     const Vec2 targetPos = world_.players[target].entity.position;
     const Vec2 to = targetPos - enemy.position;
     const float dist = to.length();
@@ -1132,7 +1496,7 @@ void Simulation::updateEnemies(float dt) {
                 moving = true;
             }
         }
-        if (moving) {
+        if (moving && enemy.stunTime <= 0.0f) {  // a stunned enemy is rooted
             const Vec2 to = dest - enemy.position;
             if (to.length() > 1.0f) {
                 const float spd = enemy.speed * (enemy.slowTime > 0.0f ? kStatusSlowFactor : 1.0f);
@@ -1172,6 +1536,10 @@ void Simulation::hurtEnemy(Entity& enemy, int damage, const Vec2& fromDir, int k
     // Heavier enemies (bigger radius) resist knockback; bosses barely flinch.
     const float resist = 14.0f / std::max(enemy.radius, 1.0f);
     enemy.knockback = fromDir * (kKnockback * resist);
+    // Hit-stop juice: a hit that bites deep (>=25% of the target's max HP) hangs
+    // the frame. A kill adds its own, bigger freeze in killEnemy just below.
+    if (enemy.hp > 0 && enemy.maxHp > 0 && damage * 4 >= enemy.maxHp)
+        world_.hitStop = std::min(kHitStopMax, std::max(world_.hitStop, kHitStopHeavyHit));
     if (enemy.hp <= 0) killEnemy(enemy, killerId);
 }
 
@@ -1182,9 +1550,16 @@ void Simulation::resolveEnemyContact(int playerId) {
         if (!enemy.alive) continue;
         if (!overlaps(p.entity, enemy)) continue;
 
+        // Dodge boon: a roll can shrug the blow entirely, granting brief i-frames.
+        const int dodge = dodgePctFor(p);
+        if (dodge > 0 && static_cast<int>(nextRand() % 100) < dodge) {
+            p.invuln = kEnemyContactCooldown;
+            break;
+        }
+
         int dmg = enemy.contactDamage;
-        if (p.cls.id == ClassId::Tank) dmg = std::max(1, dmg / 2);  // Tank passive
-        if (p.shieldTimer > 0.0f) dmg = std::max(1, dmg / 4);       // Taunt shield
+        if (const int ar = armorPct(p); ar > 0) dmg = std::max(1, dmg * (100 - ar) / 100);  // Ironhide boon
+        if (p.shieldTimer > 0.0f) dmg = std::max(1, dmg / 4);       // Second Wind / shield
         p.entity.hp -= dmg;
         p.invuln = kEnemyContactCooldown;
         applyStatusToPlayer(p, enemy);  // e.g. a spitter leaves you poisoned + slowed
@@ -1249,8 +1624,11 @@ void Simulation::resolvePickups() {
             if (drop.item.kind == ItemKind::Gold) {
                 world_.gold += drop.item.value;
                 drop.item.weight = -1.0f;
+            } else if (drop.item.kind == ItemKind::Potion) {
+                world_.inventory.forceAdd(drop.item);  // consumables always fit (bypass the cap)
+                drop.item.weight = -1.0f;
             } else if (world_.inventory.tryAdd(drop.item)) {
-                drop.item.weight = -1.0f;  // into the shared bank
+                drop.item.weight = -1.0f;  // gear respects the weight cap (sell to make room)
             }
             if (drop.item.weight < 0.0f) break;
         }
@@ -1297,11 +1675,21 @@ Rarity Simulation::rollRarity(EnemyType from) {
 
 void Simulation::rollAffixes(Item& it, Rarity r) {
     if (content_.affixPool.empty()) return;
+    // Only roll affixes this slot can carry (offense on weapons, defense on armour,
+    // either on off-hand/jewellery) — coherent gear, no +HP swords.
+    const EquipSlot slot = resolvedSlot(it);
+    std::vector<const AffixSpec*> eligible;
+    for (const auto& spec : content_.affixPool)
+        if (slotAllowsAffix(slot, spec.type)) eligible.push_back(&spec);
+    if (eligible.empty()) return;
+
     const int count = affixCountFor(r);
+    const float mul = rarityAffixMul(r);  // rarer → bigger rolls, not just more
     for (int i = 0; i < count; ++i) {
-        const AffixSpec& spec = content_.affixPool[nextRand() % content_.affixPool.size()];
+        const AffixSpec& spec = *eligible[nextRand() % eligible.size()];
         const int span = spec.maxMag - spec.minMag;
-        const int mag = spec.minMag + (span > 0 ? static_cast<int>(nextRand() % (span + 1)) : 0);
+        const int roll = spec.minMag + (span > 0 ? static_cast<int>(nextRand() % (span + 1)) : 0);
+        const int mag = std::max(1, static_cast<int>(static_cast<float>(roll) * mul));
         it.affixes.push_back({spec.type, mag});
     }
 }
@@ -1323,6 +1711,12 @@ void Simulation::dropLoot(EnemyType from, const Vec2& at, Rarity minRarity) {
 
 void Simulation::killEnemy(Entity& enemy, int killerId) {
     enemy.alive = false;
+    // Hit-stop juice: only *meaty* kills (boss / elite / predator-alpha) freeze the
+    // frame — trash mobs don't, so mowing a horde with auto-cast abilities stays
+    // fast and fluid instead of stuttering. The big kills still land with weight.
+    if (enemy.type == EnemyType::Boss || enemy.elite || enemy.predator) {
+        world_.hitStop = std::min(kHitStopMax, std::max(world_.hitStop, kHitStopBigKill));
+    }
     // Elites are targets of desire: an extra drop, floored at Rare.
     if (enemy.elite) {
         dropLoot(enemy.type, enemy.position, Rarity::Rare);

@@ -58,6 +58,7 @@ const char* affixTypeToString(AffixType t) {
         case AffixType::MoveSpeed:   return "moveSpeed";
         case AffixType::Crit:        return "crit";
         case AffixType::Lifesteal:   return "lifesteal";
+        case AffixType::SpellPower:  return "spellPower";
     }
     return "maxHp";
 }
@@ -68,6 +69,7 @@ AffixType affixTypeFromString(const std::string& s) {
     if (s == "moveSpeed") return AffixType::MoveSpeed;
     if (s == "crit") return AffixType::Crit;
     if (s == "lifesteal") return AffixType::Lifesteal;
+    if (s == "spellPower") return AffixType::SpellPower;
     return AffixType::MaxHp;
 }
 
@@ -94,11 +96,17 @@ ClassId classIdFromString(const std::string& s) {
 }
 
 AttackStyle attackStyleFromString(const std::string& s) {
-    return s == "ranged" ? AttackStyle::Ranged : AttackStyle::Melee;
+    if (s == "ranged") return AttackStyle::Ranged;
+    if (s == "magic") return AttackStyle::Magic;
+    return AttackStyle::Melee;
 }
 
 const char* attackStyleToString(AttackStyle s) {
-    return s == AttackStyle::Ranged ? "ranged" : "melee";
+    switch (s) {
+        case AttackStyle::Ranged: return "ranged";
+        case AttackStyle::Magic:  return "magic";
+        default:                  return "melee";
+    }
 }
 
 ItemKind itemKindFromString(const std::string& s) {
@@ -114,6 +122,32 @@ AffixSpec readAffixSpec(lua_State* L) {  // spec table at stack top
     s.minMag = static_cast<int>(fieldNum(L, "min", 1));
     s.maxMag = static_cast<int>(fieldNum(L, "max", 1));
     return s;
+}
+
+UpgradeSpec readUpgradeSpec(lua_State* L) {  // entry table at stack top
+    UpgradeSpec u;
+    u.name = fieldStr(L, "name", "?");
+    u.desc = fieldStr(L, "desc", "");
+    u.effect = upgradeEffectFromString(fieldStr(L, "effect", "damage"));
+    u.magnitude = static_cast<int>(fieldNum(L, "magnitude", 0));
+    return u;
+}
+
+AbilitySpec readAbilitySpec(lua_State* L) {  // entry table at stack top
+    AbilitySpec a;
+    a.name = fieldStr(L, "name", "?");
+    a.desc = fieldStr(L, "desc", "");
+    // `weapon` gates discovery (a class like "sword", a style like "melee", or
+    // "any"); accept the legacy `style` key as a fallback.
+    a.weapon = fieldStr(L, "weapon", fieldStr(L, "style", "any").c_str());
+    a.effect = abilityEffectFromString(fieldStr(L, "effect", "nova"));
+    a.cooldown = static_cast<float>(fieldNum(L, "cooldown", 3.0));
+    a.magnitude = static_cast<int>(fieldNum(L, "magnitude", 10));
+    a.minSkill = static_cast<int>(fieldNum(L, "minSkill", 1));
+    a.status = abilityStatusFromString(fieldStr(L, "status", "none"));  // on-hit rider
+    a.statusDur = static_cast<float>(fieldNum(L, "statusDur", 2.0));
+    a.statusPower = static_cast<int>(fieldNum(L, "statusPower", 6));
+    return a;
 }
 
 PlayerClass readClass(lua_State* L) {  // entry table at stack top
@@ -140,6 +174,15 @@ Item readItem(lua_State* L) {  // entry table at stack top
     item.bonusDamage = static_cast<int>(fieldNum(L, "bonusDamage", 0));
     item.bonusMaxHp = static_cast<int>(fieldNum(L, "bonusMaxHp", 0));
     item.style = attackStyleFromString(fieldStr(L, "style", "melee"));  // weapons
+    // Paperdoll slot: use the declared "slot", else infer from kind for back-compat
+    // (a plain weapon → main hand, a plain armour → chest).
+    const std::string slotStr = fieldStr(L, "slot", "");
+    if (!slotStr.empty()) item.slot = slotFromKey(slotStr);
+    else if (item.kind == ItemKind::Weapon) item.slot = EquipSlot::MainHand;
+    else if (item.kind == ItemKind::Armor) item.slot = EquipSlot::Chest;
+    item.hands = static_cast<int>(fieldNum(L, "hands", item.kind == ItemKind::Weapon ? 1 : 0));
+    item.weaponClass = fieldStr(L, "weaponClass", "");  // weapon family for spell discovery
+    item.count = std::max(1, static_cast<int>(fieldNum(L, "count", 1)));  // potion stack size
     item.rarity = rarityFromString(fieldStr(L, "rarity", "common"));
     item.dropWeight = static_cast<float>(fieldNum(L, "dropWeight", 1.0));
 
@@ -483,9 +526,13 @@ GameContent ScriptEngine::loadContent(const std::string& dataDir) {
     loadArray<PlayerClass>(dataDir + "/classes.lua", readClass, content.classes);
     loadArray<Item>(dataDir + "/loot.lua", readItem, content.lootTable);
     loadArray<AffixSpec>(dataDir + "/affixes.lua", readAffixSpec, content.affixPool);
+    loadArray<UpgradeSpec>(dataDir + "/upgrades.lua", readUpgradeSpec, content.upgradePool);
+    loadArray<AbilitySpec>(dataDir + "/abilities.lua", readAbilitySpec, content.abilityPool);
 
-    std::fprintf(stderr, "[ScriptEngine] loaded %zu classes, %zu loot, %zu affixes\n",
-                 content.classes.size(), content.lootTable.size(), content.affixPool.size());
+    std::fprintf(stderr,
+                 "[ScriptEngine] loaded %zu classes, %zu loot, %zu affixes, %zu upgrades, %zu abilities\n",
+                 content.classes.size(), content.lootTable.size(), content.affixPool.size(),
+                 content.upgradePool.size(), content.abilityPool.size());
     return content;
 }
 
@@ -543,7 +590,9 @@ void ScriptEngine::saveState(const std::string& path, const SaveState& state) {
         out << "    { name = \"" << it.name << "\", weight = " << it.weight << ", kind = \""
             << kindToString(it.kind) << "\", value = " << it.value
             << ", bonusDamage = " << it.bonusDamage << ", bonusMaxHp = " << it.bonusMaxHp
-            << ", style = \"" << attackStyleToString(it.style) << "\", rarity = \""
+            << ", style = \"" << attackStyleToString(it.style) << "\", slot = \""
+            << slotKey(it.slot) << "\", hands = " << it.hands << ", weaponClass = \""
+            << it.weaponClass << "\", count = " << it.count << ", rarity = \""
             << rarityToString(it.rarity) << "\", affixes = {";
         for (const auto& a : it.affixes) {
             out << " { stat = \"" << affixTypeToString(a.type) << "\", magnitude = " << a.magnitude

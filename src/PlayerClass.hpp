@@ -8,7 +8,10 @@ namespace game {
 // begins here and specializes by what they pump and what they wield. Tank/Archer/
 // Healer remain as starting stat kits until ClassId is retired entirely (Phase 4).
 enum class ClassId { Human, Tank, Archer, Healer };
-enum class AttackStyle { Melee, Ranged };
+// How a weapon is wielded, and which characteristic drives its damage:
+//   Melee  -> STR   Ranged -> DEX   Magic -> INT
+// The equipped main-hand weapon sets this; unarmed falls back to the class style.
+enum class AttackStyle { Melee, Ranged, Magic };
 
 // Stat block + one signature ability for a playable class. This is the seed of
 // the full roster (berserker, mage, summoner…) in DESIGN.md. Data like this

@@ -33,11 +33,16 @@ public:
     // list, in which case draw() falls back to solid squares everywhere.
     void loadSprites(const std::vector<SpritePixels>& defs);
 
+    // Display strings for the level-up boon chooser, indexed by upgrade id (the
+    // ids carried in Player::boonChoices). Built by Game from the loaded content
+    // so the Renderer stays free of GameContent/Lua types.
+    void setUpgradeLabels(std::vector<std::string> labels) { upgradeLabels_ = std::move(labels); }
+
     // followPlayer: the local player the camera centres on in FollowLocal mode.
     // If it's out of range (e.g. a client not yet welcomed), the camera centres
     // on the world instead. In FrameParty mode followPlayer is ignored.
     void draw(const World& world, bool showBank = false, int followPlayer = 0,
-              CameraMode mode = CameraMode::FollowLocal, bool showChar = false);
+              CameraMode mode = CameraMode::FollowLocal, bool showChar = false, int bankCursor = -1);
 
     // How much the world view is magnified so sprites/tiles read bigger. The
     // world is drawn through an SDL render scale of this factor; the HUD is drawn
@@ -54,7 +59,16 @@ public:
 
 private:
     void drawHud(const World& world);
-    void drawBankOverlay(const World& world, int screenW, int screenH);
+    // The level-up boon chooser: a compact, non-pausing bottom-centre panel listing
+    // each player's pending "pick 1 of 3" offer with its hotkeys. Drawn over the
+    // live world (world keeps running), like the bank/character sheet.
+    void drawBoonChooser(const World& world, int screenW, int screenH);
+    // bankCursor: index of the item the keyboard player has selected (or -1). The
+    // selected row is highlighted and the equip/sell/unequip actions are shown.
+    // refPlayer: the player the cursor belongs to (the local seat) — the selected
+    // gear is compared against *their* equipped piece in the side panel.
+    void drawBankOverlay(const World& world, int screenW, int screenH, int bankCursor,
+                         int refPlayer);
     // The character sheet: each active player's characteristics, banked points,
     // and how to spend them. Non-pausing (drawn over a live world), like the bank.
     void drawCharSheet(const World& world, int screenW, int screenH);
@@ -126,6 +140,9 @@ private:
     // textures (destroyed in the dtor). Empty until loadSprites runs; the game
     // still draws (squares) without them.
     std::unordered_map<std::string, BakedSprite> sprites_;
+
+    // Boon-chooser display strings, indexed by upgrade id (see setUpgradeLabels).
+    std::vector<std::string> upgradeLabels_;
 
     // Grouped animations: base name → per-state frame lists, built from the
     // "base.state.frame" names at load. Frames reference textures owned by

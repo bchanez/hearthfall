@@ -7,14 +7,19 @@
 namespace game {
 namespace {
 
+// Put an item onto a paperdoll slot for the test (bypasses the wield rules).
+void give(Player& p, EquipSlot s, const Item& it) { p.slot(s) = Player::Slot{true, it}; }
+
 Player withGear() {
     Player p;
-    p.hasWeapon = true;
-    p.weapon.bonusDamage = 10;
-    p.weapon.affixes = {{AffixType::Damage, 5}, {AffixType::AttackSpeed, 20}, {AffixType::Crit, 10}};
-    p.hasArmor = true;
-    p.armor.bonusMaxHp = 40;
-    p.armor.affixes = {{AffixType::MaxHp, 25}, {AffixType::Crit, 5}, {AffixType::MoveSpeed, 10}};
+    Item wpn;
+    wpn.bonusDamage = 10;
+    wpn.affixes = {{AffixType::Damage, 5}, {AffixType::AttackSpeed, 20}, {AffixType::Crit, 10}};
+    give(p, EquipSlot::MainHand, wpn);
+    Item arm;
+    arm.bonusMaxHp = 40;
+    arm.affixes = {{AffixType::MaxHp, 25}, {AffixType::Crit, 5}, {AffixType::MoveSpeed, 10}};
+    give(p, EquipSlot::Chest, arm);
     return p;
 }
 
@@ -38,22 +43,45 @@ TEST(PlayerStats, should_convert_percent_affixes_to_multipliers) {
 
 TEST(PlayerStats, should_cap_crit_and_attack_speed) {
     Player p;
-    p.hasWeapon = true;
-    p.weapon.affixes = {{AffixType::Crit, 200}, {AffixType::AttackSpeed, 200}};
+    Item wpn;
+    wpn.affixes = {{AffixType::Crit, 200}, {AffixType::AttackSpeed, 200}};
+    give(p, EquipSlot::MainHand, wpn);
     EXPECT_EQ(critChancePct(p), 100);             // capped
     EXPECT_FLOAT_EQ(attackCooldownMul(p), 0.25f);  // capped at 75% faster
 }
 
+TEST(PlayerStats, should_title_a_caster_as_mage) {
+    Player p;
+    p.skills.arcane.level = 8;  // arcane leads → Mage, Adept tier (>=7)
+    EXPECT_STREQ(playerTitle(p), "Adept Mage");
+    p.skills.melee.level = 9;  // melee now leads → Warrior
+    EXPECT_STREQ(playerTitle(p), "Adept Warrior");
+}
+
+TEST(PlayerStats, should_sum_spell_power_from_int_affixes_and_boon) {
+    Player p;
+    p.stats.intel = 5;  // +2%/pt = +10%
+    Item staff;
+    staff.affixes = {{AffixType::SpellPower, 25}};  // +25%
+    give(p, EquipSlot::MainHand, staff);
+    p.boons.spellPowerPct = 15;  // +15%
+    EXPECT_EQ(spellPowerPct(p), 50);
+}
+
 TEST(PlayerStats, should_sum_and_cap_lifesteal) {
     Player p;
-    p.hasWeapon = true;
-    p.weapon.affixes = {{AffixType::Lifesteal, 8}};
-    p.hasArmor = true;
-    p.armor.affixes = {{AffixType::Lifesteal, 5}};
+    Item wpn;
+    wpn.affixes = {{AffixType::Lifesteal, 8}};
+    give(p, EquipSlot::MainHand, wpn);
+    Item arm;
+    arm.affixes = {{AffixType::Lifesteal, 5}};
+    give(p, EquipSlot::Chest, arm);
     EXPECT_EQ(lifestealPct(p), 13);  // 8 + 5
 
-    p.weapon.affixes = {{AffixType::Lifesteal, 90}};
-    p.hasArmor = false;
+    Item big;
+    big.affixes = {{AffixType::Lifesteal, 90}};
+    give(p, EquipSlot::MainHand, big);
+    p.slot(EquipSlot::Chest) = Player::Slot{};  // unequip armour
     EXPECT_EQ(lifestealPct(p), 60);  // capped
 }
 

@@ -18,13 +18,15 @@ float axis(SDL_Gamepad* pad, SDL_GamepadAxis a) {
     return SDL_GetGamepadAxis(pad, a) / 32767.0f;
 }
 
-Vec2 keyboardMove() {
+// `arrows` includes the arrow keys in movement. It's turned off while the bank
+// overlay is open, so the arrows drive the item cursor instead of the player.
+Vec2 keyboardMove(bool arrows = true) {
     Vec2 move{};
     const bool* keys = SDL_GetKeyboardState(nullptr);
-    if (keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_UP]) move.y -= 1.0f;
-    if (keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_DOWN]) move.y += 1.0f;
-    if (keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT]) move.x -= 1.0f;
-    if (keys[SDL_SCANCODE_D] || keys[SDL_SCANCODE_RIGHT]) move.x += 1.0f;
+    if (keys[SDL_SCANCODE_W] || (arrows && keys[SDL_SCANCODE_UP])) move.y -= 1.0f;
+    if (keys[SDL_SCANCODE_S] || (arrows && keys[SDL_SCANCODE_DOWN])) move.y += 1.0f;
+    if (keys[SDL_SCANCODE_A] || (arrows && keys[SDL_SCANCODE_LEFT])) move.x -= 1.0f;
+    if (keys[SDL_SCANCODE_D] || (arrows && keys[SDL_SCANCODE_RIGHT])) move.x += 1.0f;
     return move;
 }
 }  // namespace
@@ -81,12 +83,31 @@ bool Game::init() {
         if (netCfg_.mode == NetMode::Host && !netHost_.start(netCfg_.port)) return false;
 
         // Restore the persistent shared bank (host/local own the world).
-        const SaveState save = ScriptEngine::loadState(kSavePath);
+        SaveState save = ScriptEngine::loadState(kSavePath);
+        // Always start with a few Health Potions so healing is possible from the
+        // very first fight (dropped potions top this up; they bypass the weight cap).
+        int pots = 0;
+        for (const auto& it : save.items)
+            if (it.kind == game::ItemKind::Potion) ++pots;
+        for (int i = pots; i < 3; ++i)
+            save.items.push_back({"Health Potion", 0.5f, game::ItemKind::Potion, 25});
         sim_.setBank(save.gold, save.items);
         SDL_Log("Bank loaded: %d gold, %zu items.", save.gold, save.items.size());
     }
 
     renderer_.emplace(sdlRenderer_);
+    // Hand the Renderer display strings for the level-up boon chooser, so it can
+    // label each offered choice without knowing about GameContent/Lua.
+    {
+        // Combined choice-label space: passive boons first, then auto-cast abilities
+        // — matching the id layout the Simulation offers in Player::boonChoices.
+        std::vector<std::string> labels;
+        for (const auto& u : sim_.upgrades())
+            labels.push_back(u.desc.empty() ? u.name : u.name + " (" + u.desc + ")");
+        for (const auto& a : sim_.abilities())
+            labels.push_back("* " + a.name + (a.desc.empty() ? "" : " (" + a.desc + ")"));
+        renderer_->setUpgradeLabels(std::move(labels));
+    }
     // Art intentionally disabled: the world renders as primitives (coloured
     // squares/rings, flat ground) while we rebuild the sprite pipeline from
     // scratch. The Renderer/ScriptEngine sprite plumbing is kept and simply
@@ -142,7 +163,8 @@ void Game::run() {
         // own local seat as the desktop follow-cam anchor.
         const CameraMode cam =
             netCfg_.mode == NetMode::Local ? CameraMode::FrameParty : CameraMode::FollowLocal;
-        renderer_->draw(sim_.world(), showBank_, kKeyboardPlayer, cam, showChar_);
+        renderer_->draw(sim_.world(), showBank_, kKeyboardPlayer, cam, showChar_,
+                        showBank_ ? bankCursor_ : -1);
     }
 
     saveBank();  // persist on a clean quit (Esc / window close)
@@ -160,12 +182,57 @@ void Game::processEvents() {
                 break;
             case SDL_EVENT_KEY_DOWN: {
                 const SDL_Keycode k = e.key.key;
+                // A pending level-up boon claims the number row first: keys 1/2/3
+                // pick the offered choice, overriding class-select / stat-alloc.
+                int kbPending = 0;
+                int bankSize = 0;
+                if (client) {
+                    if (!seats_.empty() && seats_[0].client->hasSnapshot()) {
+                        const World& w = seats_[0].client->world();
+                        const int id = seats_[0].client->myId();
+                        if (id >= 0 && id < static_cast<int>(w.players.size()))
+                            kbPending = w.players[id].pendingBoons;
+                        bankSize = static_cast<int>(w.inventory.size());
+                    }
+                } else {
+                    if (kKeyboardPlayer < static_cast<int>(sim_.world().players.size()))
+                        kbPending = sim_.world().players[kKeyboardPlayer].pendingBoons;
+                    bankSize = static_cast<int>(sim_.world().inventory.size());
+                }
+                // Keep the bank cursor in range as items come and go.
+                if (bankSize > 0) bankCursor_ = std::clamp(bankCursor_, 0, bankSize - 1);
+                else bankCursor_ = 0;
+
                 if (k == SDLK_ESCAPE) {
                     running_ = false;
                 } else if (k == SDLK_TAB) {
                     showBank_ = !showBank_;
                 } else if (k == SDLK_C) {
                     showChar_ = !showChar_;  // non-pausing character sheet
+                } else if (showBank_ && (k == SDLK_UP || k == SDLK_DOWN) && bankSize > 0) {
+                    // Bank open: arrows move the item cursor (movement uses WASD only).
+                    bankCursor_ = std::clamp(bankCursor_ + (k == SDLK_UP ? -1 : 1), 0, bankSize - 1);
+                } else if (showBank_ && (k == SDLK_RETURN || k == SDLK_KP_ENTER) && bankSize > 0) {
+                    if (client) pendingEquipItem_ = bankCursor_;
+                    else sim_.applyCommand({CommandType::EquipItem, kKeyboardPlayer, {}, bankCursor_});
+                } else if (showBank_ && k == SDLK_V && bankSize > 0) {
+                    // Sell the selected item for gold (into the shared bank).
+                    if (client) pendingSellItem_ = bankCursor_;
+                    else sim_.applyCommand({CommandType::SellItem, kKeyboardPlayer, {}, bankCursor_});
+                } else if (showBank_ && k >= SDLK_1 && k <= SDLK_9) {
+                    // Bank open: a number key equips that listed item onto P1. The
+                    // world keeps running, so gearing up is an exposed, co-op moment.
+                    const int idx = static_cast<int>(k - SDLK_1);
+                    if (client)
+                        pendingEquipItem_ = idx;
+                    else
+                        sim_.applyCommand({CommandType::EquipItem, kKeyboardPlayer, {}, idx});
+                } else if (kbPending > 0 && k >= SDLK_1 && k <= SDLK_3) {
+                    const int slot = static_cast<int>(k - SDLK_1);
+                    if (client)
+                        pendingChooseUpgrade_ = slot;
+                    else
+                        sim_.applyCommand({CommandType::ChooseUpgrade, kKeyboardPlayer, {}, slot});
                 } else if (showChar_ && k >= SDLK_1 && k <= SDLK_5) {
                     // Sheet open: number keys spend a banked point into a stat.
                     const int statIndex = static_cast<int>(k - SDLK_1);
@@ -173,12 +240,6 @@ void Game::processEvents() {
                         pendingAllocStat_ = statIndex;
                     else
                         sim_.applyCommand({CommandType::AllocStat, kKeyboardPlayer, {}, statIndex});
-                } else if (k >= SDLK_1 && k <= SDLK_4) {
-                    const int classIndex = static_cast<int>(k - SDLK_1);
-                    if (client)
-                        pendingClassSelect_ = classIndex;
-                    else
-                        sim_.applyCommand({CommandType::SelectClass, kKeyboardPlayer, {}, classIndex});
                 }
                 break;
             }
@@ -207,6 +268,19 @@ void Game::processEvents() {
                 if (client) break;
                 PadPlayer* pp = findPad(e.gbutton.which);
                 if (!pp) break;
+                // A pending level-up boon claims the D-pad first: Left/Up/Right pick
+                // the offered choice, overriding the sheet cursor and class-select.
+                if (pp->playerId < static_cast<int>(sim_.world().players.size()) &&
+                    sim_.world().players[pp->playerId].pendingBoons > 0) {
+                    int slot = -1;
+                    if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) slot = 0;
+                    else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_UP) slot = 1;
+                    else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) slot = 2;
+                    if (slot >= 0) {
+                        sim_.applyCommand({CommandType::ChooseUpgrade, pp->playerId, {}, slot});
+                        break;
+                    }
+                }
                 if (showChar_) {
                     // Sheet open: the D-pad drives a per-pad cursor + spends points,
                     // so class-select is suppressed (you're in the menu).
@@ -218,12 +292,6 @@ void Game::processEvents() {
                         sim_.applyCommand({CommandType::AllocStat, pp->playerId, {}, pp->statCursor});
                     break;
                 }
-                int classIndex = -1;
-                if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) classIndex = 0;
-                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_UP) classIndex = 1;
-                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) classIndex = 2;
-                if (classIndex >= 0)
-                    sim_.applyCommand({CommandType::SelectClass, pp->playerId, {}, classIndex});
                 break;
             }
             default:
@@ -233,7 +301,8 @@ void Game::processEvents() {
 }
 
 void Game::feedKeyboardCommands() {
-    const Vec2 move = keyboardMove();
+    // While the bank is open the arrow keys drive the item cursor, not the player.
+    const Vec2 move = keyboardMove(!showBank_);
     sim_.applyCommand({CommandType::Move, kKeyboardPlayer, move, 0});
 
     const Vec2 aim = mouseAim(sim_.world().players[kKeyboardPlayer].entity.position);
@@ -289,9 +358,11 @@ net::InputState Game::collectSeatInput(const ClientSeat& seat) {
 
     Vec2 pos{kWindowWidth / 2.0f, kWindowHeight / 2.0f};
     Vec2 lastAim{1.0f, 0.0f};
+    bool pendingBoon = false;
     if (c.hasSnapshot() && c.myId() >= 0 && c.myId() < static_cast<int>(c.world().players.size())) {
         pos = c.world().players[c.myId()].entity.position;
         lastAim = c.world().players[c.myId()].aim;
+        pendingBoon = c.world().players[c.myId()].pendingBoons > 0;
     }
 
     if (seat.pad) {
@@ -307,12 +378,19 @@ net::InputState Game::collectSeatInput(const ClientSeat& seat) {
         in.unequip = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_EAST);
         in.usePotion = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
         in.dash = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
-        if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT)) in.classSelect = 0;
-        else if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP)) in.classSelect = 1;
-        else if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) in.classSelect = 2;
+        // A pending boon claims the D-pad for the choice; otherwise it selects class.
+        if (pendingBoon) {
+            if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT)) in.chooseUpgrade = 0;
+            else if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP)) in.chooseUpgrade = 1;
+            else if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) in.chooseUpgrade = 2;
+        } else {
+            if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT)) in.classSelect = 0;
+            else if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP)) in.classSelect = 1;
+            else if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) in.classSelect = 2;
+        }
     } else {
         const bool* keys = SDL_GetKeyboardState(nullptr);
-        in.move = keyboardMove();
+        in.move = keyboardMove(!showBank_);  // arrows drive the bank cursor while Tab is open
         in.aim = mouseAim(pos);
         in.attack = keys[SDL_SCANCODE_SPACE];
         in.ability = keys[SDL_SCANCODE_E];
@@ -321,7 +399,10 @@ net::InputState Game::collectSeatInput(const ClientSeat& seat) {
         in.usePotion = keys[SDL_SCANCODE_Q];
         in.dash = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT];
         in.classSelect = pendingClassSelect_;
-        in.allocStat = pendingAllocStat_;  // set by the C-sheet number keys
+        in.allocStat = pendingAllocStat_;          // set by the C-sheet number keys
+        in.chooseUpgrade = pendingChooseUpgrade_;  // set by the boon-chooser number keys
+        in.equipItem = pendingEquipItem_;          // set by the bank-overlay equip keys
+        in.sellItem = pendingSellItem_;            // set by the bank-overlay sell key (V)
     }
     return in;
 }
@@ -336,6 +417,9 @@ void Game::runClientFrame() {
     }
     pendingClassSelect_ = -1;
     pendingAllocStat_ = -1;
+    pendingChooseUpgrade_ = -1;
+    pendingEquipItem_ = -1;
+    pendingSellItem_ = -1;
 
     // Render an interpolated view slightly in the past for smooth motion.
     constexpr Uint64 kInterpDelayMs = 100;
@@ -343,7 +427,7 @@ void Game::runClientFrame() {
 
     if (!seats_.empty() && seats_[0].client->hasSnapshot()) {
         renderer_->draw(seats_[0].client->view(renderMs), showBank_, seats_[0].client->myId(),
-                        CameraMode::FollowLocal, showChar_);
+                        CameraMode::FollowLocal, showChar_, showBank_ ? bankCursor_ : -1);
     } else {
         World empty;
         renderer_->draw(empty, showBank_, 0, CameraMode::FollowLocal, showChar_);
@@ -393,6 +477,12 @@ void Game::applyRemoteInput(int playerId, const net::InputState& in) {
         sim_.applyCommand({CommandType::SelectClass, playerId, {}, in.classSelect});
     if (in.allocStat >= 0)
         sim_.applyCommand({CommandType::AllocStat, playerId, {}, in.allocStat});
+    if (in.chooseUpgrade >= 0)
+        sim_.applyCommand({CommandType::ChooseUpgrade, playerId, {}, in.chooseUpgrade});
+    if (in.equipItem >= 0)
+        sim_.applyCommand({CommandType::EquipItem, playerId, {}, in.equipItem});
+    if (in.sellItem >= 0)
+        sim_.applyCommand({CommandType::SellItem, playerId, {}, in.sellItem});
 }
 
 // --- gamepad bookkeeping -----------------------------------------------------

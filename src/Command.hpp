@@ -16,7 +16,10 @@ enum class CommandType {
     Unequip,
     UsePotion,
     Dash,
-    AllocStat,  // spend one banked point into a characteristic
+    AllocStat,      // spend one banked point into a characteristic
+    ChooseUpgrade,  // pick a level-up boon: classIndex carries the slot (0..2)
+    EquipItem,      // equip a specific bank item: classIndex carries its index
+    SellItem,       // sell a bank item for gold: classIndex carries its index
 };
 
 struct Command {

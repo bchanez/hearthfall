@@ -170,6 +170,9 @@ std::vector<uint8_t> encodeInput(const InputState& in) {
     b.push_back(in.dash ? 1 : 0);
     putI32(b, in.classSelect);
     putI32(b, in.allocStat);
+    putI32(b, in.chooseUpgrade);
+    putI32(b, in.equipItem);
+    putI32(b, in.sellItem);
     return b;
 }
 
@@ -194,6 +197,9 @@ bool decodeInput(const std::vector<uint8_t>& p, InputState& out) {
     out.dash = dsh != 0;
     out.classSelect = r.i32();
     out.allocStat = r.i32();
+    out.chooseUpgrade = r.i32();
+    out.equipItem = r.i32();
+    out.sellItem = r.i32();
     return r.ok;
 }
 
@@ -211,6 +217,13 @@ std::vector<uint8_t> encodeSnapshot(const World& w) {
         putF32(b, it.weight);
         putI32(b, static_cast<int32_t>(it.kind));
         putI32(b, static_cast<int32_t>(it.rarity));
+        putI32(b, it.value);
+        putI32(b, it.bonusDamage);
+        putI32(b, it.bonusMaxHp);
+        putI32(b, static_cast<int32_t>(it.style));
+        putI32(b, static_cast<int32_t>(it.slot));  // paperdoll slot (client compare panel)
+        putI32(b, it.hands);
+        putI32(b, it.count);  // potion stack size
         putI32(b, static_cast<int32_t>(it.affixes.size()));
         for (const auto& a : it.affixes) {
             putI32(b, static_cast<int32_t>(a.type));
@@ -237,9 +250,12 @@ std::vector<uint8_t> encodeSnapshot(const World& w) {
         putF32(b, p.shieldTimer);
         putF32(b, p.healFlash);
         putF32(b, p.abilityCooldown);
-        putI32(b, p.hasWeapon ? p.weapon.bonusDamage : 0);
-        putI32(b, p.hasArmor ? p.armor.bonusMaxHp : 0);
-        b.push_back(static_cast<uint8_t>(p.weapon.style));  // sword vs bow overlay
+        // Compact equipped-gear summary for the client (sprite + HUD only): the
+        // whole paperdoll's damage/HP totals and the main-hand style. The full
+        // per-slot gear stays host-side; clients only render.
+        putI32(b, gearDamage(p));
+        putI32(b, gearMaxHp(p));
+        b.push_back(static_cast<uint8_t>(effectiveStyle(p)));  // sword/bow/staff overlay
         // Characteristics + progression, so the client HUD/sheet can show them.
         putI32(b, p.stats.str);
         putI32(b, p.stats.dex);
@@ -252,8 +268,15 @@ std::vector<uint8_t> encodeSnapshot(const World& w) {
         // Skill levels, so the client can show the emergent title + sheet.
         putI32(b, p.skills.melee.level);
         putI32(b, p.skills.ranged.level);
+        putI32(b, p.skills.arcane.level);
         putI32(b, p.skills.heal.level);
         putI32(b, p.skills.dodge.level);
+        // Level-up boon offer, so a client can render its own choice box + count.
+        putI32(b, p.pendingBoons);
+        putI32(b, p.boonChoices[0]);
+        putI32(b, p.boonChoices[1]);
+        putI32(b, p.boonChoices[2]);
+        putI32(b, p.boons.count);
     }
 
     int32_t aliveEnemies = 0;
@@ -309,6 +332,13 @@ bool decodeSnapshot(const std::vector<uint8_t>& p, World& out) {
         it.weight = r.f32();
         it.kind = static_cast<ItemKind>(r.i32());
         it.rarity = static_cast<Rarity>(r.i32());
+        it.value = r.i32();
+        it.bonusDamage = r.i32();
+        it.bonusMaxHp = r.i32();
+        it.style = static_cast<AttackStyle>(r.i32());
+        it.slot = static_cast<EquipSlot>(r.i32());
+        it.hands = r.i32();
+        it.count = r.i32();
         const int32_t affixCount = r.i32();
         for (int a = 0; a < affixCount && r.ok; ++a) {
             Affix af;
@@ -343,13 +373,24 @@ bool decodeSnapshot(const std::vector<uint8_t>& p, World& out) {
         pl.abilityCooldown = r.f32();
         const int wpnBonus = r.i32();
         const int armBonus = r.i32();
-        pl.hasWeapon = wpnBonus > 0;
-        pl.weapon.bonusDamage = wpnBonus;
-        pl.hasArmor = armBonus > 0;
-        pl.armor.bonusMaxHp = armBonus;
         uint8_t wstyle = 0;
         r.get(&wstyle, 1);
-        pl.weapon.style = static_cast<AttackStyle>(wstyle);
+        // Rebuild a minimal paperdoll for rendering: a main-hand weapon carrying
+        // the summarised style/damage, and a chest piece carrying the HP total.
+        if (wpnBonus > 0 || wstyle != 0) {
+            Item w2;
+            w2.slot = EquipSlot::MainHand;
+            w2.hands = 1;
+            w2.bonusDamage = wpnBonus;
+            w2.style = static_cast<AttackStyle>(wstyle);
+            pl.slot(EquipSlot::MainHand) = Player::Slot{true, w2};
+        }
+        if (armBonus > 0) {
+            Item a2;
+            a2.slot = EquipSlot::Chest;
+            a2.bonusMaxHp = armBonus;
+            pl.slot(EquipSlot::Chest) = Player::Slot{true, a2};
+        }
         pl.stats.str = r.i32();
         pl.stats.dex = r.i32();
         pl.stats.intel = r.i32();
@@ -361,8 +402,14 @@ bool decodeSnapshot(const std::vector<uint8_t>& p, World& out) {
         (void)xpNeeded;  // the HUD derives it from level; kept only for wire symmetry
         pl.skills.melee.level = r.i32();
         pl.skills.ranged.level = r.i32();
+        pl.skills.arcane.level = r.i32();
         pl.skills.heal.level = r.i32();
         pl.skills.dodge.level = r.i32();
+        pl.pendingBoons = r.i32();
+        pl.boonChoices[0] = r.i32();
+        pl.boonChoices[1] = r.i32();
+        pl.boonChoices[2] = r.i32();
+        pl.boons.count = r.i32();
         w.players.push_back(std::move(pl));
     }
 

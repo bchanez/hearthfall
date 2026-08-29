@@ -15,6 +15,15 @@ struct Projectile {
     bool alive = true;
     int owner = 0;       // playerId that fired it (for threat attribution)
     bool hostile = false;  // fired by an enemy → hits players instead of enemies
+    int pierce = 0;      // Pierce boon: enemies this bolt can pass through before dying
+    int lastHit = -1;    // id of the last enemy hit, so a piercing bolt doesn't re-hit it
+
+    // Optional on-hit status rider carried by ability projectiles (burn/slow/stun/
+    // knock). statusType is AbilityStatus's integer value; 0 = none. Applied to
+    // whatever the bolt strikes. Purely host-side, so it isn't networked.
+    int statusType = 0;
+    float statusDur = 0.0f;
+    int statusPower = 0;
 };
 
 }  // namespace game

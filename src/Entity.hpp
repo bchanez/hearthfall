@@ -44,6 +44,7 @@ struct Entity {
     // damage-over-time ticks each step while active, the slow scales speed. This
     // is the shared substrate for enemy venom, boss telegraphs and on-hit affixes.
     float burnTime = 0.0f, poisonTime = 0.0f, slowTime = 0.0f;
+    float stunTime = 0.0f;           // frozen (no move, no attack) while >0
     int burnDps = 0, poisonDps = 0;  // damage per second while the timer runs
     float dotAccum = 0.0f;           // fractional damage carried between steps
 

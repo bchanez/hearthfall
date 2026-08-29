@@ -34,11 +34,23 @@ public:
     // Seed the shared bank from a save (host/local only).
     void setBank(int gold, const std::vector<Item>& items);
 
+    // The draft pools (for the Renderer's choice-box labels). The level-up chooser
+    // offers a combined space: boon ids [0, upgrades) then ability ids after them.
+    const std::vector<UpgradeSpec>& upgrades() const { return content_.upgradePool; }
+    const std::vector<AbilitySpec>& abilities() const { return content_.abilityPool; }
+
 private:
     void initPlayer(int playerId, int classIndex, int level);
-    void reclass(int playerId, int classIndex);  // change class, keep level/xp/stats
     void recomputeStats(Player& p);              // maxHp/speed from class + stats + gear
     void allocStat(int playerId, int statIndex);  // spend a banked point (non-pausing)
+    void driftStat(Player& p);  // auto-grow a characteristic toward your playstyle on level-up
+    int dodgePctFor(const Player& p) const;  // capped dodge chance from boons
+    void chooseUpgrade(int playerId, int slot);   // apply an offered level-up choice
+    void rollBoonChoices(Player& p);              // roll 3 distinct offers into boonChoices
+    void grantAbility(Player& p, int abilityId);  // add or rank up an auto-cast ability
+    void updateAbilities(Player& p, int playerId, float dt);  // tick + auto-cast
+    void castAbility(Player& p, int playerId, const AbilitySpec& spec, int rank);
+    int nearestEnemyIndex(const Vec2& from) const;  // closest living enemy, or -1
     void autoAllocate(Player& p, int n);          // sensible defaults for level-matched joins
     void gainSkill(Skill& s, int amount);         // use-based skill XP + level-ups
     void spawnWave();                            // builds the current wave's roster
@@ -53,7 +65,8 @@ private:
     void updatePlayer(Player& p, float dt);
     void performAttack(int playerId);
     void performAbility(int playerId);
-    void performUsePotion(int playerId);  // consume a bank potion to heal
+    void performUsePotion(int playerId);         // quaff the first bank potion to heal
+    void drinkPotionAt(int playerId, int idx);   // drink a specific bank potion (heal by rarity)
     void performDash(int playerId);       // burst move + i-frames
     void resolveEnemyContact(int playerId);
     void downPlayer(int playerId);
@@ -65,13 +78,23 @@ private:
     int partyMaxLevel() const;
 
     // Equipment (drawn from / returned to the shared bank).
-    void equipBest(int playerId);
-    void equipBestOfKind(int playerId, ItemKind kind);
-    void unequip(int playerId);
+    void equipBest(int playerId);                   // auto-equip every improving item
+    void equipItemAt(int playerId, int bankIndex);  // equip a specific bank item
+    void sellItemAt(int bankIndex);                 // sell a bank item for gold
+    void unequip(int playerId);                     // strip all gear back to the bank
+    // Place an item onto the paperdoll per the wield rules (2H clears the off-hand,
+    // a second 1H weapon dual-wields, etc.); displaced gear returns to the bank.
+    void equipResolved(Player& p, const Item& picked);
+    // Which physical slot `it` would occupy on `p` right now (accounts for the
+    // free ring finger and dual-wield). Used to compare against what's equipped.
+    EquipSlot landingSlot(const Player& p, const Item& it) const;
 
     void updateProjectiles(float dt);
     void updateEnemies(float dt);
-    void tickStatus(Entity& e, float dt);  // burn/poison DoT + slow timers
+    void tickStatus(Entity& e, float dt);  // burn/poison/stun DoT + slow timers
+    // Apply an ability's on-hit status rider (burn/slow/stun/knock) to an enemy.
+    void applyAbilityStatus(Entity& enemy, AbilityStatus st, float dur, int power,
+                            const Vec2& dir);
     // Ranged/caster enemies: keep distance, fire, or telegraph a heavy blast.
     void enemyRangedAct(Entity& enemy, int target, float dt, bool& holdPosition);
     void applyStatusToPlayer(Player& p, const Entity& source);  // e.g. spitter venom
