@@ -173,6 +173,7 @@ std::vector<uint8_t> encodeInput(const InputState& in) {
     putI32(b, in.chooseUpgrade);
     putI32(b, in.equipItem);
     putI32(b, in.sellItem);
+    putI32(b, in.sellJunk);
     return b;
 }
 
@@ -200,6 +201,7 @@ bool decodeInput(const std::vector<uint8_t>& p, InputState& out) {
     out.chooseUpgrade = r.i32();
     out.equipItem = r.i32();
     out.sellItem = r.i32();
+    out.sellJunk = r.i32();
     return r.ok;
 }
 

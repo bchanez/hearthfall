@@ -81,6 +81,7 @@ private:
     void equipBest(int playerId);                   // auto-equip every improving item
     void equipItemAt(int playerId, int bankIndex);  // equip a specific bank item
     void sellItemAt(int bankIndex);                 // sell a bank item for gold
+    int sellJunk();                                 // bulk-sell all Common gear; returns gold gained
     void unequip(int playerId);                     // strip all gear back to the bank
     // Place an item onto the paperdoll per the wield rules (2H clears the off-hand,
     // a second 1H weapon dual-wields, etc.); displaced gear returns to the bank.

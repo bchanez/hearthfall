@@ -1123,7 +1123,7 @@ void Renderer::drawBankOverlay(const World& world, int screenW, int screenH, int
 
     setColor(sdl_, 200, 220, 245);
     SDL_RenderDebugText(sdl_, x, screenH / 2.0f - 24.0f,
-                        "Up/Down: select   Enter: use/equip (drink potions)   V: sell   G: unequip");
+                        "Up/Down: select   Enter: use/equip (drink potions)   V: sell   X: sell junk   G: unequip");
     setColor(sdl_, 240, 235, 200);
     SDL_RenderDebugText(sdl_, x, screenH / 2.0f - 12.0f,
                         "(1-9 quick-use   Q: quick-heal   move with WASD   Tab to close)");
@@ -1178,6 +1178,21 @@ void Renderer::drawCharSheet(const World& world, int screenW, int screenH) {
                           p.masteryOf(p.weapon().weaponClass));
             SDL_RenderDebugText(sdl_, x, y, line);
             y += 12.0f;
+        }
+        // Drafted auto-cast spells: name + rank + how close to firing. Re-drafting a
+        // spell you already own ranks it up (faster cooldown); this is where you see it.
+        // Spells persist through weapon swaps — the weapon only gates what's *offered*.
+        if (!p.abilities.empty()) {
+            setColor(sdl_, 180, 150, 220);
+            for (const auto& a : p.abilities) {
+                const char* name = (a.specId >= 0 && a.specId < static_cast<int>(abilityNames_.size()))
+                                       ? abilityNames_[a.specId].c_str()
+                                       : "Spell";
+                const char* state = a.cooldown > 0.0f ? "charging" : "ready";
+                std::snprintf(line, sizeof(line), "   spell: %s  Rank %d  (%s)", name, a.rank, state);
+                SDL_RenderDebugText(sdl_, x, y, line);
+                y += 12.0f;
+            }
         }
         y += 4.0f;
     }

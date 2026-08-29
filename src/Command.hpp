@@ -20,6 +20,7 @@ enum class CommandType {
     ChooseUpgrade,  // pick a level-up boon: classIndex carries the slot (0..2)
     EquipItem,      // equip a specific bank item: classIndex carries its index
     SellItem,       // sell a bank item for gold: classIndex carries its index
+    SellJunk,       // sell every unequipped Common-rarity piece of gear at once
 };
 
 struct Command {

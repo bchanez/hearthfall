@@ -93,6 +93,7 @@ private:
     int pendingChooseUpgrade_ = -1;  // client: boon slot picked this frame (keyboard seat)
     int pendingEquipItem_ = -1;      // client: bank item index equipped this frame (keyboard seat)
     int pendingSellItem_ = -1;       // client: bank item index sold this frame (keyboard seat)
+    bool pendingSellJunk_ = false;   // client: bulk-sell-junk requested this frame (keyboard seat)
     int bankCursor_ = 0;             // P1's selected row in the bank overlay (Tab menu)
 
     NetConfig netCfg_;

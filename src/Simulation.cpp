@@ -400,6 +400,24 @@ void Simulation::sellItemAt(int bankIndex) {
     world_.inventory.removeAt(static_cast<std::size_t>(bankIndex));
 }
 
+int Simulation::sellJunk() {
+    // One-tap declutter: sell every unequipped Common-rarity piece of gear in the
+    // shared bank for its gold value. Potions and anything Uncommon+ are spared, so
+    // you keep the roll-hunting depth but stop babysitting grey drops. Iterate back
+    // to front so removals don't shift indices we haven't visited yet.
+    int gained = 0;
+    const auto& items = world_.inventory.items();
+    for (int i = static_cast<int>(items.size()) - 1; i >= 0; --i) {
+        const Item& it = items[i];
+        const bool gear = it.kind == ItemKind::Weapon || it.kind == ItemKind::Armor;
+        if (!gear || it.rarity != Rarity::Common) continue;
+        gained += std::max(1, it.value) * std::max(1, it.count);
+        world_.inventory.removeAt(static_cast<std::size_t>(i));
+    }
+    world_.gold += gained;
+    return gained;
+}
+
 void Simulation::unequip(int playerId) {
     if (playerId < 0 || playerId >= static_cast<int>(world_.players.size())) return;
     Player& p = world_.players[playerId];
@@ -910,6 +928,9 @@ void Simulation::applyCommand(const Command& cmd) {
             break;
         case CommandType::SellItem:
             sellItemAt(cmd.classIndex);  // classIndex carries the bank index
+            break;
+        case CommandType::SellJunk:
+            sellJunk();  // bulk-sell every Common piece of gear
             break;
     }
 }

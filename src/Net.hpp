@@ -31,6 +31,7 @@ struct InputState {
     int chooseUpgrade = -1;  // level-up boon slot (0..2) picked this frame, or -1
     int equipItem = -1;      // bank item index to equip this frame, or -1
     int sellItem = -1;       // bank item index to sell this frame, or -1
+    int sellJunk = 0;        // 1 == bulk-sell all Common gear this frame
 };
 
 enum MsgType : uint8_t { MSG_WELCOME = 1, MSG_SNAPSHOT = 2, MSG_INPUT = 3 };

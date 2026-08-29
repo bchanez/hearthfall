@@ -38,6 +38,11 @@ public:
     // so the Renderer stays free of GameContent/Lua types.
     void setUpgradeLabels(std::vector<std::string> labels) { upgradeLabels_ = std::move(labels); }
 
+    // Display names for drafted auto-cast abilities, indexed by specId (index into
+    // GameContent::abilityPool). Lets the character sheet name each spell + its rank
+    // without the Renderer knowing about GameContent/Lua types.
+    void setAbilityNames(std::vector<std::string> names) { abilityNames_ = std::move(names); }
+
     // followPlayer: the local player the camera centres on in FollowLocal mode.
     // If it's out of range (e.g. a client not yet welcomed), the camera centres
     // on the world instead. In FrameParty mode followPlayer is ignored.
@@ -143,6 +148,7 @@ private:
 
     // Boon-chooser display strings, indexed by upgrade id (see setUpgradeLabels).
     std::vector<std::string> upgradeLabels_;
+    std::vector<std::string> abilityNames_;  // by specId; for the character sheet spell list
 
     // Grouped animations: base name → per-state frame lists, built from the
     // "base.state.frame" names at load. Frames reference textures owned by

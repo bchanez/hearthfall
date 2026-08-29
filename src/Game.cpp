@@ -107,6 +107,13 @@ bool Game::init() {
         for (const auto& a : sim_.abilities())
             labels.push_back("* " + a.name + (a.desc.empty() ? "" : " (" + a.desc + ")"));
         renderer_->setUpgradeLabels(std::move(labels));
+
+        // Ability names indexed by specId, so the character sheet can show each
+        // drafted spell by name + rank (the sim only stores the specId).
+        std::vector<std::string> abilityNames;
+        for (const auto& a : sim_.abilities())
+            abilityNames.push_back(a.name);
+        renderer_->setAbilityNames(std::move(abilityNames));
     }
     // Art intentionally disabled: the world renders as primitives (coloured
     // squares/rings, flat ground) while we rebuild the sprite pipeline from
@@ -219,6 +226,10 @@ void Game::processEvents() {
                     // Sell the selected item for gold (into the shared bank).
                     if (client) pendingSellItem_ = bankCursor_;
                     else sim_.applyCommand({CommandType::SellItem, kKeyboardPlayer, {}, bankCursor_});
+                } else if (showBank_ && k == SDLK_X) {
+                    // Bulk-declutter: sell every unequipped Common piece in one tap.
+                    if (client) pendingSellJunk_ = true;
+                    else sim_.applyCommand({CommandType::SellJunk, kKeyboardPlayer, {}, 0});
                 } else if (showBank_ && k >= SDLK_1 && k <= SDLK_9) {
                     // Bank open: a number key equips that listed item onto P1. The
                     // world keeps running, so gearing up is an exposed, co-op moment.
@@ -403,6 +414,7 @@ net::InputState Game::collectSeatInput(const ClientSeat& seat) {
         in.chooseUpgrade = pendingChooseUpgrade_;  // set by the boon-chooser number keys
         in.equipItem = pendingEquipItem_;          // set by the bank-overlay equip keys
         in.sellItem = pendingSellItem_;            // set by the bank-overlay sell key (V)
+        in.sellJunk = pendingSellJunk_ ? 1 : 0;    // set by the bank-overlay sell-junk key (X)
     }
     return in;
 }
@@ -420,6 +432,7 @@ void Game::runClientFrame() {
     pendingChooseUpgrade_ = -1;
     pendingEquipItem_ = -1;
     pendingSellItem_ = -1;
+    pendingSellJunk_ = false;
 
     // Render an interpolated view slightly in the past for smooth motion.
     constexpr Uint64 kInterpDelayMs = 100;
@@ -483,6 +496,8 @@ void Game::applyRemoteInput(int playerId, const net::InputState& in) {
         sim_.applyCommand({CommandType::EquipItem, playerId, {}, in.equipItem});
     if (in.sellItem >= 0)
         sim_.applyCommand({CommandType::SellItem, playerId, {}, in.sellItem});
+    if (in.sellJunk)
+        sim_.applyCommand({CommandType::SellJunk, playerId, {}, 0});
 }
 
 // --- gamepad bookkeeping -----------------------------------------------------
